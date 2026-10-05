@@ -4,7 +4,7 @@
 |---|---|
 | **Project** | CS 457 Networked Tic-Tac-Toe |
 | **Author** | Evan Lira |
-| **Protocol version** | 1.0 |
+| **Protocol version** | 1.2 |
 | **Last updated** | 2026-10-04 |
 | **Transport** | TCP (one long-lived connection per client) |
 | **Serialization** | JSON, UTF-8 |
@@ -16,22 +16,41 @@
 ## Contents
 
 1. [Protocol Overview](#1-protocol-overview)
-2. [Framing Rule (Option A: Newline-Delimited JSON)](#2-framing-rule-option-a-newline-delimited-json)
+2. [Transport Layer & Packet Framing Mechanism](#2-transport-layer--packet-framing-mechanism)
 3. [Common Message Envelope & Data Types](#3-common-message-envelope--data-types)
-4. [Message Catalog](#4-message-catalog)
+4. [Message Structures](#4-message-structures)
 5. [Error Codes & Validation Order](#5-error-codes--validation-order)
 6. [Session State Machine](#6-session-state-machine)
 7. [Disconnect & Forfeit Management](#7-disconnect--forfeit-management)
 8. [Wire Examples](#8-wire-examples)
+9. [AI Implementation Constraints](#9-ai-implementation-constraints)
+10. [Revision History](#10-revision-history)
+
+### Sprint 1 Requirements Traceability
+
+| Sprint 1 requirement | Where it is met |
+|---|---|
+| Design the protocol and FSM before writing application code | This entire document; FSM in [§6](#6-session-state-machine) |
+| **2.1** Transport protocol: TCP | [§2.1](#21-transport--serialization) |
+| **2.1** Serialization format: structured JSON | [§2.1](#21-transport--serialization), [§3](#3-common-message-envelope--data-types) |
+| **2.1** Deterministic framing rule that handles coalescing and fragmentation | [§2.2](#22-the-framing-rule)–[§2.4](#24-receiver-rules); worked cases in [§8.4](#84-coalescing--fragmentation-how-the-receiver-buffer-evolves) |
+| **2.1** Wire stream example (continuous stream) | [§8.2](#82-continuous-stream-client--server), byte-level in [§8.3](#83-byte-level-view-xxd) |
+| **2.1** JSON schema / structure specification (`MOVE`) | [§3.1](#31-envelope), [§4.4](#44-move) |
+| **2.2** Exact message structures for all eight message types | [§4](#4-message-structures) |
+| Explicit message schemas | [§3](#3-common-message-envelope--data-types), [§4](#4-message-structures) |
+| Explicit state transitions | [§6.1](#61-room-states-sow-23) (diagram), [§6.2](#62-state-transition-table) (table) |
+| Show how AI assistants are prompted and constrained to follow this blueprint | [§9](#9-ai-implementation-constraints) |
 
 ---
 
 ## 1. Protocol Overview
 
 - **Architecture:** client–server. One server hosts a single game room with exactly two player slots. Clients never talk to each other.
-- **Server-authoritative:** the server owns the board, turn order, scores, and win/draw detection. Clients only send intents (`MOVE`, `REMATCH`, `DISCONNECT`) and render whatever the server sends in `STATE_UPDATE` and `GAME_OVER`. A client never updates its local board on its own.
+- **Server-authoritative:** the server owns the board, turn order, scores, and win/draw detection. Clients only send intents (`CONNECT`, `MOVE`, `DISCONNECT`) and render whatever the server sends in `STATE_UPDATE` and `GAME_OVER`. A client never updates its local board on its own.
+- **Roles:** the first player to connect is **Player 1** (`PLAYER_1`, plays `X`). The second is **Player 2** (`PLAYER_2`, plays `O`). Roles stay the same for the whole match.
 - **Match vs. game:** a *match* is the series of games played by the same two players. Scores belong to the match and reset when a new opponent joins. A *game* is one board, from empty to win, draw, or forfeit.
-- **Turn order (SOW §1.2):** the first player to connect is `X` and the second is `O` for the whole match. Who moves first in game 1 is random. After that it alternates every game.
+- **Turn order (SOW §1.2):** who moves first in game 1 is random. After that it alternates every game.
+- **Reset or quit (SOW §1.2):** after a win or draw, the server starts the next game automatically after `NEXT_GAME_DELAY_S`. A player who wants to stop sends `DISCONNECT`.
 
 ### 1.1 Protocol Constants
 
@@ -40,17 +59,35 @@
 | `DEFAULT_PORT` | `5457/tcp` | Can be overridden on the command line; client connects to `server.lira.edu:5457` |
 | `ENCODING` | UTF-8 | All bytes on the wire |
 | `DELIMITER` | `0x0A` (`\n`) | Terminates every message |
-| `MAX_FRAME_BYTES` | `4096` | Includes the trailing `\n`. The largest real message is about 240 bytes. |
-| `PLAYER_ID_PATTERN` | `^[A-Za-z0-9_-]{1,16}$` | Player names |
+| `MAX_FRAME_BYTES` | `4096` | Includes the trailing `\n`. The largest real message is 275 bytes. |
+| `PLAYER_ID_PATTERN` | `^[A-Za-z0-9_-]{1,16}$` | Player aliases |
 | `SERVER_ID` | `"SERVER"` | Reserved `player_id` used on every server→client message |
 | `TURN_TIMEOUT_S` | `60` | Active player must move within this window (§7.4) |
-| `REMATCH_TIMEOUT_S` | `60` | Both players must answer within this window after `GAME_OVER` (§7.4) |
+| `NEXT_GAME_DELAY_S` | `5` | Pause between `GAME_OVER` and the next `GAME_START` (§7.4) |
 
 ---
 
-## 2. Framing Rule (Option A: Newline-Delimited JSON)
+## 2. Transport Layer & Packet Framing Mechanism
 
-### 2.1 The Rule
+### 2.1 Transport & Serialization
+
+| | |
+|---|---|
+| **Transport protocol** | TCP. The server listens on `5457/tcp`. Each client opens one connection and keeps it for the whole session. |
+| **Serialization format** | Structured JSON, UTF-8 encoded. One JSON object per message (envelope in §3). |
+| **Framing mechanism** | **Option A: newline-delimited JSON (`\n` framing).** Each message is terminated by byte `0x0A`. |
+
+**Why Option A instead of Option B (length prefix) or Option C (pipe-delimited text):**
+
+- **Readable on the wire.** Every frame is plain text, so it can be read directly in Wireshark's *Follow TCP Stream* (Sprint 5) and tested by hand with `nc server.lira.edu 5457`. A binary length prefix would show up as unreadable bytes.
+- **No delimiter collisions.** The usual risk with delimiter framing is a payload that contains the delimiter. Compact JSON escapes every newline inside a string, so a raw `0x0A` can never appear inside a message (§2.5). That removes the main advantage of Option B.
+- **Bounded memory.** Messages are under 300 bytes, and `MAX_FRAME_BYTES` = 4096 caps the receive buffer. That gives the same bounded allocation that a length prefix provides.
+- **Structured nested data.** The board, scores, role map, and winning line are nested. JSON represents them directly, where Option C would need a custom grammar with secondary delimiters for each message.
+- **Easy debugging.** A 3×3 board is a JSON array of arrays, so printing a raw frame shows the grid as it is: `"board":[["X","-","-"],["O","X","-"],["-","-","-"]]`. If an `X` lands in the wrong cell, the printed message shows it right away.
+
+The one weakness of newline framing for this project is user-typed text (player aliases). It is handled explicitly in §2.5.
+
+### 2.2 The Framing Rule
 
 > Every message is one JSON object, UTF-8 encoded, and terminated by exactly one newline character `\n` (`0x0A`). The receiver adds incoming bytes to a per-connection stream buffer until it sees a `\n`. It then takes out the complete line and deserializes it as one JSON object.
 
@@ -59,9 +96,14 @@
 <stream> ::= <frame>*
 ```
 
-TCP is a byte stream, not a message stream. A single `recv()` can return part of one frame, exactly one frame, several frames, or the end of one frame plus the start of the next. The `\n` delimiter is the only message boundary. Message boundaries are **never** inferred from `recv()` call boundaries (see the segmentation examples in §8.4).
+TCP is a continuous byte stream with no built-in message boundaries. Two things follow, and the framing rule handles both:
 
-### 2.2 Sender Rules
+- **Coalescing:** messages sent back-to-back can arrive in a single `recv()` chunk. The receiver extracts **every** complete `\n`-terminated frame in the buffer, not just the first one.
+- **Fragmentation:** a single message can be split across several `recv()` chunks. The receiver keeps the incomplete tail in the buffer until the rest arrives, and never parses a frame before its `\n`.
+
+Both can happen in the same chunk (the end of one message plus the start of the next). The `\n` delimiter is the only message boundary. Message boundaries are **never** inferred from `recv()` call boundaries. This makes the rule deterministic: the same byte stream produces the same messages however TCP splits it (worked examples in §8.4).
+
+### 2.3 Sender Rules
 
 1. Serialize with **compact** JSON on a single line: `json.dumps(msg, separators=(",", ":"))`.
    **Never** use `indent=`. Pretty-printing inserts raw newlines inside the object and breaks framing.
@@ -70,7 +112,7 @@ TCP is a byte stream, not a message stream. A single `recv()` can return part of
 4. Write with `sock.sendall(frame)`, not `send()`. `send()` may write only part of the buffer.
 5. One message per frame. Never put two JSON objects on the same line or wrap several messages in an array.
 
-### 2.3 Receiver Rules
+### 2.4 Receiver Rules
 
 1. Keep **one byte buffer per connection**. Never share a buffer between sockets.
 2. Append every `recv()` chunk to the buffer.
@@ -80,13 +122,21 @@ TCP is a byte stream, not a message stream. A single `recv()` can return part of
 6. If a frame, or the unterminated data left in the buffer, reaches `MAX_FRAME_BYTES` without a `\n`, the receiver gives up on the stream. The server sends `ERROR FRAME_TOO_LARGE` (fatal) and closes the connection.
 7. `recv()` returning `b""` means the peer closed the connection (EOF). Any bytes still in the buffer are a **truncated frame**. They are discarded and never processed.
 
-### 2.4 Why `\n` Framing Is Safe
+### 2.5 Why `\n` Framing Is Safe
 
 - **JSON escapes newlines inside strings.** The JSON grammar does not allow raw control characters (U+0000–U+001F, including LF) inside strings, so they must be escaped. A line break inside a `reason` string goes on the wire as the two characters `\` `n` (bytes `0x5C 0x6E`), never as a raw `0x0A`. A compact encoder therefore never emits a raw `0x0A` inside a message.
 - **UTF-8 never hides `0x0A` inside a multi-byte character.** Every byte of a multi-byte UTF-8 sequence is `≥ 0x80`, so a `0x0A` byte always means LF. Splitting on raw bytes *before* decoding is safe.
 - **No whitespace between tokens.** Compact separators mean the only `0x0A` in a correctly formed stream is the delimiter.
 
-### 2.5 Reference Implementation (Python)
+**Caveat: user-typed text (player aliases).** Players choose their own alias, and an alias that carries a raw `\n` onto the wire would end the frame early and split one message into two broken ones. Three independent layers prevent this:
+
+1. **Client input check.** The client calls `.strip()` on the typed alias and checks it against `PLAYER_ID_PATTERN` (`^[A-Za-z0-9_-]{1,16}$`) **before** sending `CONNECT`. Newlines, spaces, tabs, and other control characters fail the pattern, so the client asks again and sends nothing.
+2. **Serializer escaping.** Every message is built with `json.dumps()`, which turns a newline inside a string into the two characters `\` `n`. Messages are **never** assembled with f-strings or string concatenation (e.g. `'{"player_id":"' + name + '"}'`), because that would put the user's raw newline onto the wire.
+3. **Server validation.** The server checks the alias against the same pattern and rejects anything else with `ERROR INVALID_NAME`. A newline that reaches the server inside a correctly escaped string is therefore rejected, not stored, and can never be echoed to the other player.
+
+The only other free-text field a client sends is `DISCONNECT.reason`. It is protected by layer 2, and the server only logs it, never forwards it. §8.6 shows both the correct and the broken behavior on the wire.
+
+### 2.6 Reference Implementation (Python)
 
 ```python
 import json
@@ -168,9 +218,9 @@ Every message, in both directions, is a JSON object with this top-level shape:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `msg_type` | `string` | **Yes** | One of the nine types in §4. Uppercase and case-sensitive. |
-| `player_id` | `PlayerId` or `"SERVER"` | **Yes** | Sender identity. Clients use their registered name. The server always uses `"SERVER"`. |
-| `payload` | `object` | Conditional | Required when the message type defines required payload fields. It may be left out, or sent as `{}`, for types with no payload (`CONNECT`, `REMATCH`, client `DISCONNECT`). A missing payload is treated as `{}`. |
+| `msg_type` | `string` | **Yes** | One of the eight types in §4. Uppercase and case-sensitive. |
+| `player_id` | `PlayerId` or `"SERVER"` | **Yes** | Sender identity. Clients use their registered alias. The server always uses `"SERVER"`. |
+| `payload` | `object` | Conditional | Required when the message type defines required payload fields. It may be left out, or sent as `{}`, for types with no required payload fields (`CONNECT`, `DISCONNECT`). A missing payload is treated as `{}`. |
 | `timestamp` | `integer` | **Yes** | Sender's Unix epoch time in whole seconds (UTC), e.g. `int(time.time())`. Informational and for logs only. It is **not** used for ordering (TCP already guarantees order) and it is **not** validated against the receiver's clock. |
 
 ### 3.2 Data Types
@@ -181,11 +231,13 @@ Every message, in both directions, is a JSON object with this top-level shape:
 | `integer` | JSON number with no fraction or exponent | Python: validate with `type(v) is int`. `isinstance(v, int)` wrongly accepts `True`/`False`. |
 | `boolean` | `true` / `false` | — |
 | `null` | `null` | Used only where a field is listed as nullable |
-| `PlayerId` | string | Matches `^[A-Za-z0-9_-]{1,16}$`. Must not equal `SERVER` (case-insensitive). Unique within the room. |
-| `Symbol` | string | `"X"` or `"O"` |
-| `Cell` | string | `"X"`, `"O"`, or `""` (empty) |
+| `PlayerId` | string | The player's alias. Matches `^[A-Za-z0-9_-]{1,16}$`: letters, digits, `_`, and `-` only, so no spaces, `\n`, or other control characters (§2.5). Must not equal `SERVER` (case-insensitive). Unique within the room. |
+| `Role` | string | `"PLAYER_1"` or `"PLAYER_2"` |
+| `Symbol` | string | `"X"` or `"O"`. `PLAYER_1` always plays `X` and `PLAYER_2` always plays `O`. |
+| `Cell` | string | `"X"`, `"O"`, or `"-"` (empty). `"-"` keeps a printed board readable, e.g. `[["X","-","-"],["O","X","-"],["-","-","-"]]`. |
 | `Board` | array of 3 arrays of 3 `Cell` | Indexed as `board[row][col]` |
 | `Coord` | array of 2 integers | `[row, col]`, each 0–2 |
+| `Scores` | object | `PlayerId → integer ≥ 0`. Always contains exactly the two players in the match. |
 
 ### 3.3 Board Coordinates
 
@@ -211,60 +263,81 @@ Row 0 is the top and column 0 is the left:
 
 ---
 
-## 4. Message Catalog
+## 4. Message Structures
 
-| # | `msg_type` | Direction | Delivery | Purpose |
-|---|---|---|---|---|
-| 1 | `CONNECT` | Client → Server | — | Join the room with a chosen `player_id` |
-| 2 | `LOBBY_WAIT` | Server → Client | Unicast | Registered and waiting for an opponent |
-| 3 | `GAME_START` | Server → Client | Unicast to each player | New game begins: symbols, first turn, scores |
-| 4 | `MOVE` | Client → Server | — | Place your symbol at (`row`, `col`) |
-| 5 | `STATE_UPDATE` | Server → Client | Broadcast (identical bytes to both) | Authoritative board and whose turn it is |
-| 6 | `GAME_OVER` | Server → Client | Broadcast to remaining players | Win, draw, or forfeit, with updated scores |
-| 7 | `REMATCH` | Client → Server | — | Ask to play another game against the same opponent |
-| 8 | `DISCONNECT` | **Both directions** | Unicast | Graceful leave (client) or forced removal (server) |
-| 9 | `ERROR` | Server → Client | Unicast to offender | Rejected message, invalid move, or protocol violation |
+This section defines the exact structure of every message exchanged between the clients and the server. There are exactly eight message types:
 
-> `REMATCH` and `DISCONNECT` are added to the seven types in the SOW. `REMATCH` supports the "following games are alternated" rule in SOW §1.2. `DISCONNECT` supports forfeit management (§7).
+| # | Message Type | Direction | Purpose & Description | Delivery | Payload fields | Spec |
+|---|---|---|---|---|---|---|
+| 1 | `CONNECT` | Client → Server | Client requests to join the game room with a player alias. | — | *(none; the alias is the envelope `player_id`)* | [§4.1](#41-connect) |
+| 2 | `LOBBY_WAIT` | Server → Client | Server notifies Client 1 that it is waiting for Player 2 to connect. | Unicast | `players_connected`, `players_required`, `message` | [§4.2](#42-lobby_wait) |
+| 3 | `GAME_START` | Server → Clients | Server notifies both clients that the game has started and assigns roles (Player 1 / Player 2). | Unicast to each player | `game_number`, `your_role`, `players`, `first_turn`, `turn_timeout_s` | [§4.3](#43-game_start) |
+| 4 | `MOVE` | Client → Server | Active player submits move coordinates. | — | `row`, `col` | [§4.4](#44-move) |
+| 5 | `STATE_UPDATE` | Server → Clients | Server broadcasts the updated board state, scores, and active player turn. | Broadcast (identical bytes to both) | `board`, `current_turn`, `move_number`, `last_move`, `scores`, `draws` | [§4.5](#45-state_update) |
+| 6 | `ERROR` | Server → Client | Server notifies the client of an out-of-turn move, invalid coordinates, or a malformed message. | Unicast to the offender | `code`, `message`, `ref_msg_type`, `fatal` | [§4.6](#46-error) |
+| 7 | `DISCONNECT` | Client → Server | Client notifies the server of an intentional departure/quit. | — | `reason` *(optional)* | [§4.7](#47-disconnect) |
+| 8 | `GAME_OVER` | Server → Clients | Server broadcasts the final game outcome (Winner / Draw / Forfeit) and final scores. | Broadcast to players still connected | `result`, `winner`, `winning_line`, `forfeit_reason`, `scores`, `draws`, `next_game_in_s` | [§4.8](#48-game_over) |
 
-The examples below are pretty-printed for readability. **On the wire, every message is compact and on a single line** (see §8).
+Each subsection below gives the envelope values, every payload field (type, whether it is required, and its allowed values), an exact example, and the same message in its single-line wire form. The pretty-printed examples are for readability. **On the wire, every message is compact JSON on one line followed by `\n`** (see §2 and §8).
 
 ---
 
-### 4.1 `CONNECT` (Client → Server)
+### 4.1 `CONNECT`
 
-Sent once, as the first message after the TCP connection opens, to register in the room.
+**Direction:** Client → Server  ·  **Sent:** once, as the first message after the TCP connection opens
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `player_id` *(envelope)* | `PlayerId` | Yes | The name the client wants to use |
-| `payload` | — | No | No payload fields |
+| Envelope field | Value |
+|---|---|
+| `msg_type` | `"CONNECT"` |
+| `player_id` | The alias the client wants to use (`PlayerId`) |
+| `payload` | Leave it out or send `{}`. There are no payload fields. |
+
+**Exact structure:**
 
 ```json
-{"msg_type": "CONNECT", "player_id": "Alice", "timestamp": 1727000000}
+{
+  "msg_type": "CONNECT",
+  "player_id": "Alice",
+  "timestamp": 1727000000
+}
 ```
+
+**Wire form:**
+
+```
+{"msg_type":"CONNECT","player_id":"Alice","timestamp":1727000000}\n
+```
+
+**Client behavior before sending:** strip the typed alias and check it against `PLAYER_ID_PATTERN`. If it fails (for example it contains a space or newline), ask the user again without sending anything (§2.5).
 
 **Server response:**
 
 | Condition | Response |
 |---|---|
-| First player in an empty room | `LOBBY_WAIT` to the sender |
-| Second player | `GAME_START` to each player, followed by `STATE_UPDATE` to both |
-| Name fails `PLAYER_ID_PATTERN` or is `SERVER` | `ERROR INVALID_NAME` (not fatal; the client may send `CONNECT` again) |
-| Name already used by the other player | `ERROR NAME_TAKEN` (not fatal; the client may send `CONNECT` again) |
+| First player in an empty room | `LOBBY_WAIT` to the sender. The sender becomes `PLAYER_1`. |
+| Second player | The sender becomes `PLAYER_2`. `GAME_START` goes to each player, followed by `STATE_UPDATE` to both. |
+| Alias fails `PLAYER_ID_PATTERN` or is `SERVER` | `ERROR INVALID_NAME` (not fatal; the client may send `CONNECT` again) |
+| Alias already used by the other player | `ERROR NAME_TAKEN` (not fatal; the client may send `CONNECT` again) |
 | Two players already registered | `ERROR ROOM_FULL` (**fatal**; the connection is closed) |
 
 ---
 
-### 4.2 `LOBBY_WAIT` (Server → Client)
+### 4.2 `LOBBY_WAIT`
 
-Tells a registered player that they are waiting for an opponent. Sent (a) after the first player's successful `CONNECT`, and (b) to the remaining player after their opponent leaves (§7.2).
+**Direction:** Server → Client (unicast)  ·  **Sent:** (a) after the first player's successful `CONNECT`, and (b) to the remaining player after their opponent leaves (§7.2)
 
-| Field | Type | Required | Constraints | Description |
+| Envelope field | Value |
+|---|---|
+| `msg_type` | `"LOBBY_WAIT"` |
+| `player_id` | `"SERVER"` |
+
+| Payload field | Type | Required | Constraints | Description |
 |---|---|---|---|---|
 | `players_connected` | `integer` | Yes | `1` | Registered players in the room, including the recipient |
 | `players_required` | `integer` | Yes | `2` | Players needed to start |
 | `message` | `string` | Yes | ≤ 128 chars | Status text to show the user |
+
+**Exact structure:**
 
 ```json
 {
@@ -279,21 +352,38 @@ Tells a registered player that they are waiting for an opponent. Sent (a) after 
 }
 ```
 
+**Wire form:**
+
+```
+{"msg_type":"LOBBY_WAIT","player_id":"SERVER","payload":{"players_connected":1,"players_required":2,"message":"Waiting for an opponent..."},"timestamp":1727000000}\n
+```
+
+**Client behavior:** show `message` and keep waiting. The next message will be `GAME_START`.
+
 ---
 
-### 4.3 `GAME_START` (Server → Client)
+### 4.3 `GAME_START`
 
-Sent to **each** player separately, because `your_symbol` is different for each recipient. Sent when the second player registers (`game_number` = 1) and when both players send `REMATCH` (`game_number` + 1). The server **always** follows it immediately with a `STATE_UPDATE` (`move_number` = 0), so clients have one rendering path.
+**Direction:** Server → Clients (one copy to each player)  ·  **Sent:** when the second player registers (`game_number` = 1), and `NEXT_GAME_DELAY_S` after each `WIN`/`DRAW` (`game_number` + 1)
 
-| Field | Type | Required | Constraints | Description |
+The two copies differ only in `your_role`, so each player gets its own message. The server **always** follows `GAME_START` immediately with a `STATE_UPDATE` (`move_number` = 0). That `STATE_UPDATE` carries the starting board, the scores, and whose turn it is, so clients have one rendering path.
+
+| Envelope field | Value |
+|---|---|
+| `msg_type` | `"GAME_START"` |
+| `player_id` | `"SERVER"` |
+
+| Payload field | Type | Required | Constraints | Description |
 |---|---|---|---|---|
-| `game_number` | `integer` | Yes | ≥ 1 | 1 for the first game of a match, +1 per rematch |
-| `players` | `object` | Yes | `{"X": PlayerId, "O": PlayerId}` | Symbol assignment, fixed for the whole match |
-| `your_symbol` | `Symbol` | Yes | `"X"` or `"O"` | The recipient's symbol |
+| `game_number` | `integer` | Yes | ≥ 1 | 1 for the first game of a match, +1 for each later game |
+| `your_role` | `Role` | Yes | `"PLAYER_1"` or `"PLAYER_2"` | **The role assigned to the recipient** |
+| `players` | `object` | Yes | Exactly the keys `PLAYER_1` and `PLAYER_2` | Role assignment for both players, fixed for the match |
+| `players.<role>.player_id` | `PlayerId` | Yes | — | Alias of the player who holds that role |
+| `players.<role>.symbol` | `Symbol` | Yes | `PLAYER_1` → `"X"`, `PLAYER_2` → `"O"` | Symbol that player places on the board |
 | `first_turn` | `PlayerId` | Yes | One of the two players | Who moves first this game. Random for game 1, then alternates. |
-| `scores` | `object` | Yes | `PlayerId → integer ≥ 0` | Match wins **before** this game |
-| `draws` | `integer` | Yes | ≥ 0 | Match draws before this game |
 | `turn_timeout_s` | `integer` | Yes | ≥ 0 (`0` = disabled) | Seconds allowed per turn (§7.4) |
+
+**Exact structure** (Alice's copy; Bob's copy is identical except `"your_role": "PLAYER_2"`):
 
 ```json
 {
@@ -301,27 +391,43 @@ Sent to **each** player separately, because `your_symbol` is different for each 
   "player_id": "SERVER",
   "payload": {
     "game_number": 1,
-    "players": {"X": "Alice", "O": "Bob"},
-    "your_symbol": "X",
+    "your_role": "PLAYER_1",
+    "players": {
+      "PLAYER_1": {"player_id": "Alice", "symbol": "X"},
+      "PLAYER_2": {"player_id": "Bob", "symbol": "O"}
+    },
     "first_turn": "Alice",
-    "scores": {"Alice": 0, "Bob": 0},
-    "draws": 0,
     "turn_timeout_s": 60
   },
   "timestamp": 1727000010
 }
 ```
 
+**Wire form:**
+
+```
+{"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":1,"your_role":"PLAYER_1","players":{"PLAYER_1":{"player_id":"Alice","symbol":"X"},"PLAYER_2":{"player_id":"Bob","symbol":"O"}},"first_turn":"Alice","turn_timeout_s":60},"timestamp":1727000010}\n
+```
+
+**Client behavior:** save `your_role` and `players` so the UI can show "You are Player 1 (X) vs. Bob (O)". Then wait for the `STATE_UPDATE` that follows.
+
 ---
 
-### 4.4 `MOVE` (Client → Server)
+### 4.4 `MOVE`
 
-Asks the server to place the sender's symbol on a cell. Only valid while a game is in progress and only from the player named in the latest `STATE_UPDATE.current_turn`.
+**Direction:** Client → Server  ·  **Sent:** by the active player only (the `current_turn` in the latest `STATE_UPDATE`) while a game is in progress
 
-| Field | Type | Required | Constraints | Description |
+| Envelope field | Value |
+|---|---|
+| `msg_type` | `"MOVE"` |
+| `player_id` | The sender's registered alias |
+
+| Payload field | Type | Required | Constraints | Description |
 |---|---|---|---|---|
 | `row` | `integer` | Yes | 0–2 | Board row (0 = top) |
 | `col` | `integer` | Yes | 0–2 | Board column (0 = left) |
+
+**Exact structure:**
 
 ```json
 {
@@ -335,127 +441,99 @@ Asks the server to place the sender's symbol on a cell. Only valid while a game 
 }
 ```
 
+**Wire form:**
+
+```
+{"msg_type":"MOVE","player_id":"Player_1","payload":{"row":0,"col":2},"timestamp":1727000000}\n
+```
+
 **Server response:**
 - **Accepted:** a `STATE_UPDATE` broadcast to both players. If the move ends the game, a `GAME_OVER` broadcast follows.
 - **Rejected:** an `ERROR` to the sender only (validation order in §5.2). The board and turn do not change, and it is still the sender's turn.
 
 ---
 
-### 4.5 `STATE_UPDATE` (Server → Client, broadcast)
+### 4.5 `STATE_UPDATE`
 
-The authoritative game state. Both players receive identical bytes. Sent after `GAME_START` and after every accepted `MOVE`.
+**Direction:** Server → Clients (broadcast; both players receive identical bytes)  ·  **Sent:** right after every `GAME_START`, and after every accepted `MOVE`
 
-| Field | Type | Required | Constraints | Description |
+Each `STATE_UPDATE` describes the whole game screen on its own: board, scores, and whose turn it is. A client only needs the most recent one to draw its display.
+
+| Envelope field | Value |
+|---|---|
+| `msg_type` | `"STATE_UPDATE"` |
+| `player_id` | `"SERVER"` |
+
+| Payload field | Type | Required | Constraints | Description |
 |---|---|---|---|---|
-| `board` | `Board` | Yes | 3×3 of `"X"`, `"O"`, `""` | Full board, sent every time (never a diff) |
-| `current_turn` | `PlayerId` or `null` | Yes | — | Who must move next. `null` after the game-ending move. |
+| `board` | `Board` | Yes | 3×3 of `"X"`, `"O"`, `"-"` | Full board, sent every time (never a diff) |
+| `current_turn` | `PlayerId` or `null` | Yes | — | **Active player:** who must move next. `null` after the game-ending move. |
 | `move_number` | `integer` | Yes | 0–9 | Moves played so far in this game |
 | `last_move` | `object` or `null` | Yes | — | The move that produced this state. `null` when `move_number` = 0. |
 | `last_move.player_id` | `PlayerId` | Yes* | — | Who moved |
 | `last_move.symbol` | `Symbol` | Yes* | — | Symbol placed |
 | `last_move.row` | `integer` | Yes* | 0–2 | — |
 | `last_move.col` | `integer` | Yes* | 0–2 | — |
+| `scores` | `Scores` | Yes | — | **Match wins** for each player. The game-ending `STATE_UPDATE` already counts the game it ends. |
+| `draws` | `integer` | Yes | ≥ 0 | Match draws, counted the same way |
 
 <sub>* Required when `last_move` is not `null`.</sub>
+
+**Exact structure:**
 
 ```json
 {
   "msg_type": "STATE_UPDATE",
   "player_id": "SERVER",
   "payload": {
-    "board": [["X", "O", ""],
-              ["",  "X", ""],
-              ["",  "",  ""]],
+    "board": [["X", "O", "-"],
+              ["-", "X", "-"],
+              ["-", "-", "-"]],
     "current_turn": "Bob",
     "move_number": 3,
-    "last_move": {"player_id": "Alice", "symbol": "X", "row": 0, "col": 0}
+    "last_move": {"player_id": "Alice", "symbol": "X", "row": 0, "col": 0},
+    "scores": {"Alice": 0, "Bob": 0},
+    "draws": 0
   },
   "timestamp": 1727000025
 }
 ```
 
----
+**Wire form:**
 
-### 4.6 `GAME_OVER` (Server → Client, broadcast)
-
-Reports the end of a game. After a winning or drawing move, it always comes **right after** the final `STATE_UPDATE` (the one with `current_turn: null`). After a forfeit, it is sent only to the remaining player and the board is not resent.
-
-| Field | Type | Required | Constraints | Description |
-|---|---|---|---|---|
-| `result` | `string` | Yes | `"WIN"`, `"DRAW"`, `"FORFEIT"` | How the game ended |
-| `winner` | `PlayerId` or `null` | Yes | `null` only for `DRAW` | Winner. For `FORFEIT`, the player who stayed. |
-| `winning_line` | array of 3 `Coord`, or `null` | Yes | Non-null only for `WIN` | The three winning cells, ordered by row and then column |
-| `forfeit_reason` | `string` or `null` | Yes | Non-null only for `FORFEIT`: `"DISCONNECT"`, `"CONNECTION_LOST"`, `"TIMEOUT"` | Why the opponent forfeited (§7.1) |
-| `scores` | `object` | Yes | `PlayerId → integer` | Match wins **including** this game |
-| `draws` | `integer` | Yes | ≥ 0 | Match draws including this game |
-| `rematch_allowed` | `boolean` | Yes | — | `true` for `WIN`/`DRAW`. `false` for `FORFEIT`, because the opponent is gone. |
-
-**Scoring:** `WIN`: winner +1. `DRAW`: `draws` +1. `FORFEIT`: the remaining player +1.
-**Determinism:** if one move completes two lines at once, the server reports the first one found in this check order: rows 0→2, columns 0→2, main diagonal, anti-diagonal.
-
-```json
-{
-  "msg_type": "GAME_OVER",
-  "player_id": "SERVER",
-  "payload": {
-    "result": "WIN",
-    "winner": "Alice",
-    "winning_line": [[0, 0], [1, 1], [2, 2]],
-    "forfeit_reason": null,
-    "scores": {"Alice": 1, "Bob": 0},
-    "draws": 0,
-    "rematch_allowed": true
-  },
-  "timestamp": 1727000035
-}
 ```
+{"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["X","O","-"],["-","X","-"],["-","-","-"]],"current_turn":"Bob","move_number":3,"last_move":{"player_id":"Alice","symbol":"X","row":0,"col":0},"scores":{"Alice":0,"Bob":0},"draws":0},"timestamp":1727000025}\n
+```
+
+**Client behavior:** redraw the board and scoreboard. If `current_turn` is this client's alias, ask the user for a move. Otherwise show "Waiting for <opponent>...".
 
 ---
 
-### 4.7 `REMATCH` (Client → Server)
+### 4.6 `ERROR`
 
-Sent after a `GAME_OVER` with `rematch_allowed: true` to ask for another game against the same opponent. When **both** players have sent it, the server starts the next game (`GAME_START` + `STATE_UPDATE`) with `first_turn` switched to the other player. A duplicate `REMATCH` from the same player is ignored. To **decline**, the client sends `DISCONNECT`.
+**Direction:** Server → Client (unicast to the offending client only; never broadcast)  ·  **Sent:** when a client message is rejected, or right before the server closes a connection
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `payload` | — | No | No payload fields |
+| Envelope field | Value |
+|---|---|
+| `msg_type` | `"ERROR"` |
+| `player_id` | `"SERVER"` |
 
-```json
-{"msg_type": "REMATCH", "player_id": "Bob", "timestamp": 1727000039}
-```
-
----
-
-### 4.8 `DISCONNECT` (Both Directions)
-
-**Client → Server:** "I am leaving." After sending it, the client closes its socket. If it is sent while a game is in progress, it is a **forfeit** (§7). If it is sent after `GAME_OVER`, it declines the rematch.
-
-**Server → Client:** "You are being removed." Sent before the server closes a connection for a reason that is not a protocol error: turn timeout, rematch timeout, or server shutdown. When the client receives it, it shows `reason` to the user and closes its socket. (Protocol errors use `ERROR` with `fatal: true` instead.)
-
-| Field | Type | Required | Constraints | Description |
-|---|---|---|---|---|
-| `reason` | `string` | Client: optional. Server: **required**. | ≤ 128 chars | Readable explanation |
-
-```json
-{"msg_type": "DISCONNECT", "player_id": "Bob", "payload": {"reason": "Player quit"}, "timestamp": 1727000032}
-```
-
-```json
-{"msg_type": "DISCONNECT", "player_id": "SERVER", "payload": {"reason": "Turn timeout (60 s)"}, "timestamp": 1727000085}
-```
-
----
-
-### 4.9 `ERROR` (Server → Client)
-
-Sent only to the client whose message was rejected. Never broadcast.
-
-| Field | Type | Required | Constraints | Description |
+| Payload field | Type | Required | Constraints | Description |
 |---|---|---|---|---|
 | `code` | `string` | Yes | One of the codes in §5.1 | Machine-readable reason |
 | `message` | `string` | Yes | ≤ 128 chars | Text to show the user |
-| `ref_msg_type` | `string` or `null` | Yes | — | `msg_type` of the rejected message, or `null` if it could not be parsed |
+| `ref_msg_type` | `string` or `null` | Yes | — | `msg_type` of the rejected message, or `null` if it could not be parsed or the error was not caused by a message |
 | `fatal` | `boolean` | Yes | — | `true` means the server closes this connection right after sending |
+
+The three cases in the purpose description map to these codes. §5.1 has the full list.
+
+| Case | `code` |
+|---|---|
+| Out-of-turn move | `NOT_YOUR_TURN` |
+| Invalid coordinates | `OUT_OF_BOUNDS`, `CELL_OCCUPIED` |
+| Malformed message | `MALFORMED_JSON`, `INVALID_FIELD`, `UNKNOWN_MSG_TYPE`, `FRAME_TOO_LARGE` |
+
+**Exact structure:**
 
 ```json
 {
@@ -471,42 +549,149 @@ Sent only to the client whose message was rejected. Never broadcast.
 }
 ```
 
+**Wire form:**
+
+```
+{"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"NOT_YOUR_TURN","message":"It is Alice's turn.","ref_msg_type":"MOVE","fatal":false},"timestamp":1727000012}\n
+```
+
+**Client behavior:** show `message`. If `fatal` is `false`, carry on; after a rejected `MOVE`, ask the user to try again. If `fatal` is `true`, expect EOF, close the socket, and exit.
+
+---
+
+### 4.7 `DISCONNECT`
+
+**Direction:** Client → Server  ·  **Sent:** when the user deliberately quits (e.g. types `quit` or presses Ctrl-C)
+
+| Envelope field | Value |
+|---|---|
+| `msg_type` | `"DISCONNECT"` |
+| `player_id` | The sender's registered alias |
+
+| Payload field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `reason` | `string` | No | ≤ 128 chars | Readable explanation, used for server logs |
+
+**Exact structure:**
+
+```json
+{
+  "msg_type": "DISCONNECT",
+  "player_id": "Bob",
+  "payload": {
+    "reason": "Player quit"
+  },
+  "timestamp": 1727000032
+}
+```
+
+**Wire form:**
+
+```
+{"msg_type":"DISCONNECT","player_id":"Bob","payload":{"reason":"Player quit"},"timestamp":1727000032}\n
+```
+
+**Server response:** the server sends **nothing back** to the departing client and closes its socket. What happens to the opponent depends on the room state (§7.2):
+- **During a game:** the departure is a **forfeit**. The opponent receives `GAME_OVER` (`FORFEIT`) and then `LOBBY_WAIT`.
+- **Between games:** the next game is canceled. The opponent receives `LOBBY_WAIT`.
+- **In the lobby:** the player is removed. No one else is notified.
+
+The server never sends `DISCONNECT`. When the server itself ends a connection (turn timeout, shutdown, protocol violation), it sends an `ERROR` with `fatal: true` instead (§7.3).
+
+---
+
+### 4.8 `GAME_OVER`
+
+**Direction:** Server → Clients (broadcast to every player still connected)  ·  **Sent:** when a game ends
+
+- **Win or draw:** sent to both players **right after** the game-ending `STATE_UPDATE` (the one with `current_turn: null`).
+- **Forfeit:** sent only to the remaining player. The board is not resent.
+
+| Envelope field | Value |
+|---|---|
+| `msg_type` | `"GAME_OVER"` |
+| `player_id` | `"SERVER"` |
+
+| Payload field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `result` | `string` | Yes | `"WIN"`, `"DRAW"`, `"FORFEIT"` | How the game ended |
+| `winner` | `PlayerId` or `null` | Yes | `null` only for `DRAW` | Winner. For `FORFEIT`, the player who stayed. |
+| `winning_line` | array of 3 `Coord`, or `null` | Yes | Non-null only for `WIN` | The three winning cells, ordered by row and then column |
+| `forfeit_reason` | `string` or `null` | Yes | Non-null only for `FORFEIT`: `"DISCONNECT"`, `"CONNECTION_LOST"`, `"TIMEOUT"` | Why the opponent forfeited (§7.1) |
+| `scores` | `Scores` | Yes | — | **Final** match wins, including this game |
+| `draws` | `integer` | Yes | ≥ 0 | Final match draws, including this game |
+| `next_game_in_s` | `integer` or `null` | Yes | `NEXT_GAME_DELAY_S` for `WIN`/`DRAW`, `null` for `FORFEIT` | Seconds until the server sends `GAME_START` for the next game. `null` means there is no next game: the opponent has left and this player is going back to the lobby. |
+
+**Scoring:** `WIN`: winner +1. `DRAW`: `draws` +1. `FORFEIT`: the remaining player +1.
+**Determinism:** if one move completes two lines at once, the server reports the first one found in this check order: rows 0→2, columns 0→2, main diagonal, anti-diagonal.
+
+**Exact structure:**
+
+```json
+{
+  "msg_type": "GAME_OVER",
+  "player_id": "SERVER",
+  "payload": {
+    "result": "WIN",
+    "winner": "Alice",
+    "winning_line": [[0, 0], [1, 1], [2, 2]],
+    "forfeit_reason": null,
+    "scores": {"Alice": 1, "Bob": 0},
+    "draws": 0,
+    "next_game_in_s": 5
+  },
+  "timestamp": 1727000035
+}
+```
+
+**Wire forms for each outcome:**
+
+```
+{"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"WIN","winner":"Alice","winning_line":[[0,0],[1,1],[2,2]],"forfeit_reason":null,"scores":{"Alice":1,"Bob":0},"draws":0,"next_game_in_s":5},"timestamp":1727000035}\n
+{"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"DRAW","winner":null,"winning_line":null,"forfeit_reason":null,"scores":{"Alice":1,"Bob":0},"draws":1,"next_game_in_s":5},"timestamp":1727000090}\n
+{"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"FORFEIT","winner":"Alice","winning_line":null,"forfeit_reason":"DISCONNECT","scores":{"Alice":1,"Bob":0},"draws":0,"next_game_in_s":null},"timestamp":1727000032}\n
+```
+
+**Client behavior:** show the result and the final scores. If `next_game_in_s` is a number, show a countdown ("Next game in 5 s, type `quit` to leave"). If it is `null`, expect a `LOBBY_WAIT` next.
+
 ---
 
 ## 5. Error Codes & Validation Order
 
 ### 5.1 Error Codes
 
-| `code` | Fatal | Trigger |
-|---|---|---|
-| `MALFORMED_JSON` | No | Line is not valid UTF-8 or JSON, or is not a JSON object |
-| `FRAME_TOO_LARGE` | **Yes** | `MAX_FRAME_BYTES` reached without a `\n` |
-| `UNKNOWN_MSG_TYPE` | No | `msg_type` is missing from the catalog, or is a server→client type sent by a client |
-| `INVALID_FIELD` | No | A required field is missing or has the wrong type (e.g. `"row": "1"`) |
-| `PLAYER_ID_MISMATCH` | No | Envelope `player_id` is not the name registered to this socket |
-| `INVALID_NAME` | No | `CONNECT` name fails `PLAYER_ID_PATTERN` or is `SERVER` |
-| `NAME_TAKEN` | No | `CONNECT` name is already used by the other player |
-| `ROOM_FULL` | **Yes** | `CONNECT` when two players are already registered |
-| `UNEXPECTED_MESSAGE` | No | Valid message that is not allowed in the current state (see §6.2) |
-| `NOT_YOUR_TURN` | No | `MOVE` from the player who is not `current_turn` |
-| `OUT_OF_BOUNDS` | No | `row` or `col` is not in 0–2 |
-| `CELL_OCCUPIED` | No | Target cell is not `""` |
+| Category | `code` | Fatal | Trigger |
+|---|---|---|---|
+| Out-of-turn move | `NOT_YOUR_TURN` | No | `MOVE` from the player who is not `current_turn` |
+| Invalid coordinates | `OUT_OF_BOUNDS` | No | `row` or `col` is not in 0–2 |
+| Invalid coordinates | `CELL_OCCUPIED` | No | Target cell is not `"-"` |
+| Malformed message | `MALFORMED_JSON` | No | Line is not valid UTF-8 or JSON, or is not a JSON object |
+| Malformed message | `INVALID_FIELD` | No | A required field is missing or has the wrong type (e.g. `"row": "1"`) |
+| Malformed message | `UNKNOWN_MSG_TYPE` | No | `msg_type` is not one of the eight types, or is a server→client type sent by a client |
+| Malformed message | `FRAME_TOO_LARGE` | **Yes** | `MAX_FRAME_BYTES` reached without a `\n` |
+| Identity / registration | `PLAYER_ID_MISMATCH` | No | Envelope `player_id` is not the alias registered to this socket |
+| Identity / registration | `INVALID_NAME` | No | `CONNECT` alias fails `PLAYER_ID_PATTERN` or is `SERVER` |
+| Identity / registration | `NAME_TAKEN` | No | `CONNECT` alias is already used by the other player |
+| Identity / registration | `ROOM_FULL` | **Yes** | `CONNECT` when two players are already registered |
+| Wrong state | `UNEXPECTED_MESSAGE` | No | Valid message that is not allowed in the current state (see §6.3) |
+| Server-initiated close | `TURN_TIMEOUT` | **Yes** | Active player sent no accepted `MOVE` within `TURN_TIMEOUT_S` (§7.4) |
+| Server-initiated close | `SERVER_SHUTDOWN` | **Yes** | Server is shutting down |
 
-After a fatal error the server closes the socket. If that player was in a game, this counts as a forfeit (`CONNECTION_LOST`, §7).
+After a fatal error the server closes the socket. If that player was in a game, this counts as a forfeit (`TIMEOUT` for `TURN_TIMEOUT`, otherwise `CONNECTION_LOST`; see §7.1).
 
 ### 5.2 Validation Order for an Incoming Message
 
 The server applies these checks in order and stops at the first failure:
 
 1. Frame decodes as a JSON object → `MALFORMED_JSON`
-2. `msg_type` is a known client→server type → `UNKNOWN_MSG_TYPE`
+2. `msg_type` is a known client→server type (`CONNECT`, `MOVE`, `DISCONNECT`) → `UNKNOWN_MSG_TYPE`
 3. Envelope fields are present and correctly typed → `INVALID_FIELD`
-4. `player_id` matches the socket's registered name (skipped before `CONNECT`) → `PLAYER_ID_MISMATCH`
-5. Message is allowed in the current state (§6.2) → `UNEXPECTED_MESSAGE`
+4. `player_id` matches the socket's registered alias (skipped before `CONNECT`) → `PLAYER_ID_MISMATCH`
+5. Message is allowed in the current state (§6.3) → `UNEXPECTED_MESSAGE`
 6. Payload fields are present and correctly typed → `INVALID_FIELD`
 7. *(MOVE only)* Sender is `current_turn` → `NOT_YOUR_TURN`
 8. *(MOVE only)* `0 ≤ row ≤ 2` and `0 ≤ col ≤ 2` → `OUT_OF_BOUNDS`
-9. *(MOVE only)* `board[row][col] == ""` → `CELL_OCCUPIED`
+9. *(MOVE only)* `board[row][col] == "-"` → `CELL_OCCUPIED`
 10. Apply the move, check for a win or draw, then broadcast `STATE_UPDATE` (and `GAME_OVER` if the game ended)
 
 ---
@@ -527,28 +712,54 @@ stateDiagram-v2
     CHECK_WIN_DRAW --> PLAYER_TURN : no result / STATE_UPDATE
     CHECK_WIN_DRAW --> GAME_OVER : win or draw / STATE_UPDATE + GAME_OVER
     PLAYER_TURN --> GAME_OVER : player leaves or times out / GAME_OVER FORFEIT
-    GAME_OVER --> PLAYER_TURN : REMATCH from both / GAME_START + STATE_UPDATE
-    GAME_OVER --> CLEANUP : forfeit, DISCONNECT, or rematch timeout
+    GAME_OVER --> PLAYER_TURN : next-game delay elapsed / GAME_START + STATE_UPDATE
+    GAME_OVER --> CLEANUP : forfeit, or a player leaves between games
     CLEANUP --> WAITING_FOR_PLAYERS : reset match / LOBBY_WAIT to remaining player
 ```
 
-`EVALUATE_MOVE` and `CHECK_WIN_DRAW` are internal steps that pass immediately. While the game is in progress, the room is waiting in `PLAYER_TURN`. A server shutdown can happen in any state (§7.2).
+`EVALUATE_MOVE` and `CHECK_WIN_DRAW` are internal steps that pass immediately. While the game is in progress, the room is waiting in `PLAYER_TURN`. After a win or draw, the room stays in `GAME_OVER` for `NEXT_GAME_DELAY_S` and then starts the next game. A server shutdown can happen in any state (§7.2).
 
-### 6.2 Allowed Client Messages per State
+### 6.2 State Transition Table
 
-| Client sends | Socket not yet registered | `WAITING_FOR_PLAYERS` (in lobby) | `PLAYER_TURN` (game running) | `GAME_OVER` (awaiting rematch) |
+This table is the normative form of the diagram above. The server implementation handles exactly these transitions. Any client message not covered here is rejected as described in §6.3. **P** is the player who triggered the event and **Q** is the opponent.
+
+| # | Current state | Event | Guard | Actions (messages sent, state changes) | Next state |
+|---|---|---|---|---|---|
+| T1 | `INIT` | Server starts | Listening socket bound on `DEFAULT_PORT` | Clear room: no players, scores reset, `game_number` = 0 | `WAITING_FOR_PLAYERS` |
+| T2 | `WAITING_FOR_PLAYERS` | `CONNECT` | Room empty; alias valid | Register P as `PLAYER_1` (X). `LOBBY_WAIT` → P. | `WAITING_FOR_PLAYERS` |
+| T3 | `WAITING_FOR_PLAYERS` | `CONNECT` | One player waiting; alias valid and not taken | Register P as `PLAYER_2` (O). `game_number` = 1. Pick `first_turn` at random. Clear the board. `GAME_START` → each player, then `STATE_UPDATE` → both. Start turn timer. | `PLAYER_TURN` |
+| T4 | `WAITING_FOR_PLAYERS` | Waiting player leaves | — | Close P's socket. Free alias. | `WAITING_FOR_PLAYERS` (empty) |
+| T5 | `PLAYER_TURN` | `MOVE` | — | Run validation (§5.2) | `EVALUATE_MOVE` |
+| T6 | `EVALUATE_MOVE` | Validation fails | — | `ERROR` (non-fatal) → P. Board, turn, and turn timer unchanged. | `PLAYER_TURN` |
+| T7 | `EVALUATE_MOVE` | Validation passes | — | Place P's symbol. `move_number` += 1. | `CHECK_WIN_DRAW` |
+| T8 | `CHECK_WIN_DRAW` | No result | No three-in-a-row; board not full | `current_turn` = Q. Restart turn timer. `STATE_UPDATE` → both. | `PLAYER_TURN` |
+| T9 | `CHECK_WIN_DRAW` | Win | P has three in a row | P's score += 1. Stop turn timer. `STATE_UPDATE` (`current_turn: null`) → both, then `GAME_OVER` (`WIN`) → both. Start next-game timer. | `GAME_OVER` |
+| T10 | `CHECK_WIN_DRAW` | Draw | Board full; no three-in-a-row | `draws` += 1. Stop turn timer. `STATE_UPDATE` (`current_turn: null`) → both, then `GAME_OVER` (`DRAW`) → both. Start next-game timer. | `GAME_OVER` |
+| T11 | `PLAYER_TURN` | P leaves (`DISCONNECT`, EOF, socket error, fatal `ERROR`) | Either player's turn | Close P's socket. Stop turn timer. Q's score += 1. `GAME_OVER` (`FORFEIT`, `next_game_in_s: null`) → Q. | `CLEANUP` |
+| T12 | `PLAYER_TURN` | Turn timer expires | — | `ERROR TURN_TIMEOUT` (fatal) → active player P, then close P's socket. Q's score += 1. `GAME_OVER` (`FORFEIT`, `TIMEOUT`) → Q. | `CLEANUP` |
+| T13 | `GAME_OVER` | Next-game timer expires | Both players still connected | `game_number` += 1. `first_turn` = the player who did not move first last game. Clear the board. `GAME_START` → each player, then `STATE_UPDATE` → both. Start turn timer. | `PLAYER_TURN` |
+| T14 | `GAME_OVER` | P leaves | — | Cancel next-game timer. Close P's socket. | `CLEANUP` |
+| T15 | `CLEANUP` | (immediate) | Q still connected | Reset match: scores 0, `draws` 0, `game_number` 0. Q becomes `PLAYER_1`. `LOBBY_WAIT` → Q. | `WAITING_FOR_PLAYERS` |
+| T16 | `CLEANUP` | (immediate) | No players left | Reset match | `WAITING_FOR_PLAYERS` (empty) |
+| T17 | `PLAYER_TURN`, `GAME_OVER` | `CONNECT` from a new socket | Two players registered | `ERROR ROOM_FULL` (fatal) → new socket, then close it | unchanged |
+| T18 | any | `CONNECT` with an invalid or taken alias | — | `ERROR INVALID_NAME` / `NAME_TAKEN` (non-fatal) → sender. The sender may retry. | unchanged |
+| T19 | any | Server shutdown | — | `ERROR SERVER_SHUTDOWN` (fatal) → every registered player. Close all sockets. | *(terminated)* |
+
+### 6.3 Allowed Client Messages per State
+
+| Client sends | Socket not yet registered | `WAITING_FOR_PLAYERS` (in lobby) | `PLAYER_TURN` (game running) | `GAME_OVER` (between games) |
 |---|---|---|---|---|
 | `CONNECT` | Register, or `INVALID_NAME` / `NAME_TAKEN` / `ROOM_FULL` | `UNEXPECTED_MESSAGE` | `UNEXPECTED_MESSAGE` | `UNEXPECTED_MESSAGE` |
 | `MOVE` | `UNEXPECTED_MESSAGE` | `UNEXPECTED_MESSAGE` | Validate (§5.2) | `UNEXPECTED_MESSAGE` |
-| `REMATCH` | `UNEXPECTED_MESSAGE` | `UNEXPECTED_MESSAGE` | `UNEXPECTED_MESSAGE` | Record it. Start the next game once both have sent it. |
-| `DISCONNECT` | Close socket | Remove player; room is empty | **Forfeit** (§7) | Remove player; opponent goes back to the lobby |
+| `DISCONNECT` | Close socket | Remove player; room is empty | **Forfeit** (§7) | Remove player; cancel the next game; opponent goes back to the lobby |
 
-### 6.3 Server Send-Order Guarantees
+### 6.4 Server Send-Order Guarantees
 
 1. `GAME_START` is always followed immediately by `STATE_UPDATE` with `move_number: 0`.
 2. A game-ending move produces `STATE_UPDATE` (`current_turn: null`) and then `GAME_OVER`, in that order.
-3. A forfeit produces `GAME_OVER` (`FORFEIT`) and then `LOBBY_WAIT`, sent to the remaining player.
-4. Broadcasts are sent to both players while holding the game lock, so both players see the same sequence of states.
+3. After a `WIN`/`DRAW` `GAME_OVER`, the next message from the server is `GAME_START`, sent `NEXT_GAME_DELAY_S` later. The only exception is when the opponent leaves first, in which case it is `LOBBY_WAIT`.
+4. A forfeit produces `GAME_OVER` (`FORFEIT`) and then `LOBBY_WAIT`, sent to the remaining player.
+5. Broadcasts are sent to both players while holding the game lock, so both players see the same sequence of states.
 
 ---
 
@@ -561,8 +772,8 @@ stateDiagram-v2
 | 1 | Graceful quit | A `DISCONNECT` message arrives | `"DISCONNECT"` |
 | 2 | Orderly TCP close (process exits, socket closed) | `recv()` returns `b""` (FIN) | `"CONNECTION_LOST"` |
 | 3 | Abrupt TCP failure | `recv()`/`sendall()` raises `ConnectionResetError`, `BrokenPipeError`, or another `OSError` (RST) | `"CONNECTION_LOST"` |
-| 4 | Fatal protocol error | Server sends `ERROR` with `fatal: true` and closes the socket | `"CONNECTION_LOST"` |
-| 5 | Silent peer (CML node powered off, link down, client hung) | `TURN_TIMEOUT_S` expires with no valid `MOVE` from the active player | `"TIMEOUT"` |
+| 4 | Fatal protocol error | Server sends `ERROR` with `fatal: true` (e.g. `FRAME_TOO_LARGE`) and closes the socket | `"CONNECTION_LOST"` |
+| 5 | Silent peer (CML node powered off, link down, client hung) | `TURN_TIMEOUT_S` expires with no accepted `MOVE` from the active player. The server sends `ERROR TURN_TIMEOUT` (fatal). | `"TIMEOUT"` |
 
 Trigger 5 is needed because TCP sends nothing when a host disappears without sending FIN or RST. Without an application-level timer, the server would wait forever for that player's move.
 
@@ -574,11 +785,11 @@ When player **P** leaves (for any reason in §7.1) and **Q** is the opponent:
 |---|---|---|---|
 | Socket not yet registered | none | — | unchanged |
 | `WAITING_FOR_PLAYERS` (P alone in lobby) | none | — | `WAITING_FOR_PLAYERS` (empty) |
-| `PLAYER_TURN`: game running, **either player's turn** | `GAME_OVER` `{result: FORFEIT, winner: Q, forfeit_reason}` and then `LOBBY_WAIT` | Q +1 (shown in that `GAME_OVER`) | `CLEANUP` → `WAITING_FOR_PLAYERS` with Q as `X` for the next match |
-| `GAME_OVER` (awaiting rematch) | `LOBBY_WAIT` only. This is **not** a forfeit because the game already ended. | unchanged | `CLEANUP` → `WAITING_FOR_PLAYERS` |
-| Server shutdown (any state) | `DISCONNECT {reason: "Server shutting down"}` to every registered player, then close | — | terminated |
+| `PLAYER_TURN`: game running, **either player's turn** | `GAME_OVER` `{result: FORFEIT, winner: Q, forfeit_reason, next_game_in_s: null}` and then `LOBBY_WAIT` | Q +1 (shown in that `GAME_OVER`) | `CLEANUP` → `WAITING_FOR_PLAYERS`, with Q as `PLAYER_1` for the next match |
+| `GAME_OVER` (between games) | `LOBBY_WAIT` only, and the pending next game is canceled. This is **not** a forfeit because the game already ended. | unchanged | `CLEANUP` → `WAITING_FOR_PLAYERS`, with Q as `PLAYER_1` |
+| Server shutdown (any state) | `ERROR SERVER_SHUTDOWN` (fatal) to every registered player, then close | — | terminated |
 
-In every case the server stops sending to P, closes P's socket, and frees P's `player_id`. When a new opponent joins, a new match starts with `game_number` 1 and scores at 0.
+In every case the server stops sending to P, closes P's socket, and frees P's alias. When a new opponent joins, a new match starts with `game_number` 1 and scores at 0.
 
 ### 7.3 Graceful Exit Procedure
 
@@ -586,29 +797,32 @@ In every case the server stops sending to P, closes P's socket, and frees P's `p
 1. Send `DISCONNECT` (optionally with a `reason`).
 2. Close the socket. Do not wait for a reply. The server sends nothing back to a client that has disconnected.
 
-**Server removing a client (timeout, shutdown):**
-1. Send `DISCONNECT` (or `ERROR` with `fatal: true`) using `sendall()`.
+**Server ending a connection (timeout, shutdown, protocol violation):**
+1. Send `ERROR` with `fatal: true` and the matching `code`, using `sendall()`.
 2. Call `sock.shutdown(socket.SHUT_WR)` and then `close()`. This sends FIN after the final message, so the client can read it before it sees EOF.
+
+**Rule:** the server never closes a registered player's socket without first sending a fatal `ERROR` explaining why, unless that player has already disconnected.
 
 ### 7.4 Timeouts
 
-| Timer | Starts | Reset by | On expiry |
+| Timer | Starts | Reset / canceled by | On expiry |
 |---|---|---|---|
-| `TURN_TIMEOUT_S` (60 s) | When a `STATE_UPDATE` names a player in `current_turn` | Only an **accepted** `MOVE`. Rejected moves do not reset it. | Server sends `DISCONNECT {reason: "Turn timeout (60 s)"}` to the active player and closes their socket. Opponent gets `GAME_OVER FORFEIT (TIMEOUT)` and then `LOBBY_WAIT`. |
-| `REMATCH_TIMEOUT_S` (60 s) | When `GAME_OVER` with `rematch_allowed: true` is sent | — | Any player who has not sent `REMATCH` gets `DISCONNECT {reason: "Rematch timeout"}` and is closed. A player who did send `REMATCH` gets `LOBBY_WAIT`. |
+| `TURN_TIMEOUT_S` (60 s) | When a `STATE_UPDATE` names a player in `current_turn` | Reset only by an **accepted** `MOVE`. Rejected moves do not reset it. | Server sends `ERROR TURN_TIMEOUT` (fatal) to the active player and closes their socket. The opponent gets `GAME_OVER FORFEIT (TIMEOUT)` and then `LOBBY_WAIT`. |
+| `NEXT_GAME_DELAY_S` (5 s) | When a `WIN`/`DRAW` `GAME_OVER` is sent | Canceled if either player leaves | Server sends `GAME_START` (`game_number` + 1, `first_turn` switched to the other player) to each player, then `STATE_UPDATE` to both. |
 
-`turn_timeout_s` is sent in `GAME_START` so clients can show a countdown. A value of `0` turns the timer off (useful for debugging).
+`turn_timeout_s` is sent in `GAME_START`, and `next_game_in_s` in `GAME_OVER`, so clients can show countdowns. A `turn_timeout_s` of `0` turns the turn timer off (useful for debugging). A player who walks away between games is handled by the turn timer once the next game starts, so no separate idle timer is needed.
 
 ### 7.5 Concurrency & Races
 
-- All state changes (moves, forfeits, rematch votes, timer expiry) happen while holding **one game lock**. Events are handled one at a time, in the order they acquire the lock.
+- All state changes (moves, forfeits, timer expiry, starting the next game) happen while holding **one game lock**. Events are handled one at a time, in the order they acquire the lock.
 - **Move vs. disconnect race:** if P's winning `MOVE` is handled first, the game ends as `WIN`. P's later EOF then happens in `GAME_OVER`, so it is not a forfeit. If the EOF is handled first, P forfeits and any later bytes from P are never read.
+- **Disconnect vs. next-game timer:** if P's `DISCONNECT` or EOF is handled before the timer fires, the next game is canceled and Q gets `LOBBY_WAIT`. If the timer fires first, the next game starts and P's departure becomes a forfeit of that new game.
 - **Both players leave together:** the first departure handled produces the forfeit. By the time the second one is handled, the room is in `CLEANUP`/`WAITING_FOR_PLAYERS`, so nothing more is sent (there is no one to send to). The room resets to empty.
-- **Truncated frame at EOF:** if P's process dies in the middle of a `MOVE` (some bytes received, no `\n`), the partial frame is discarded (§2.3 rule 7). Only complete frames are ever acted on.
+- **Truncated frame at EOF:** if P's process dies in the middle of a `MOVE` (some bytes received, no `\n`), the partial frame is discarded (§2.4 rule 7). Only complete frames are ever acted on.
 
 ### 7.6 Client-Side Handling of Server Loss
 
-If the client's `recv()` returns `b""` or raises `ConnectionResetError`, the client tells the user "Connection to server lost" and exits cleanly. It does not attempt any game logic locally. Clients need no timers of their own.
+If the client's `recv()` returns `b""` or raises `ConnectionResetError`, the client tells the user "Connection to server lost" and exits cleanly. If a fatal `ERROR` came first, it shows that message instead. It does not attempt any game logic locally. Clients need no timers of their own.
 
 ---
 
@@ -649,70 +863,69 @@ The same 157 bytes. The two `0a` bytes, at offsets `0x41` and `0x9c`, are the on
                                         ^^ 0x9c = 0x0A  ← end of frame 2
 ```
 
-### 8.4 TCP Segmentation: How the Receiver Buffer Evolves
+### 8.4 Coalescing & Fragmentation: How the Receiver Buffer Evolves
 
-The same 157-byte stream can reach the server split up in different ways. The `FrameReader` (§2.5) produces the same two messages every time.
+The same 157-byte stream can reach the server split up in different ways. The `FrameReader` (§2.6) produces the same two messages every time.
 
-**Case A: coalesced (both frames in one `recv()`)**
+**Case A: coalescing (both frames arrive in one `recv()`)**
 
 | `recv()` | Bytes received | Frames extracted | Buffer after |
 |---|---|---|---|
 | #1 | all 157 bytes | `CONNECT`, `MOVE` | *(empty)* |
 
-**Case B: one frame split across two `recv()` calls**
+**Case B: fragmentation (one frame split across two `recv()` calls)**
 
 | `recv()` | Bytes received | Frames extracted | Buffer after |
 |---|---|---|---|
 | #1 | `{"msg_type":"CONNECT","player_id":"Alice` (40 B) | none (no `\n` yet) | `{"msg_type":"CONNECT","player_id":"Alice` |
 | #2 | `","timestamp":1727000000}\n{"msg_type":"MOVE",…}\n` (117 B) | `CONNECT`, `MOVE` | *(empty)* |
 
-**Case C: one and a half frames**
+**Case C: coalescing and fragmentation together (one and a half frames)**
 
 | `recv()` | Bytes received | Frames extracted | Buffer after |
 |---|---|---|---|
 | #1 | `{"msg_type":"CONNECT",…,"timestamp":1727000000}\n{"msg_type":"MOVE","player_id"` (96 B) | `CONNECT` | `{"msg_type":"MOVE","player_id"` |
 | #2 | `:"Alice","payload":{"row":0,"col":2},"timestamp":1727000005}\n` (61 B) | `MOVE` | *(empty)* |
 
-**Case D: one byte per `recv()` (worst case)**: 157 calls. Calls 1–65 and 67–156 extract nothing. Call 66 extracts `CONNECT` and call 157 extracts `MOVE`.
+**Case D: maximum fragmentation (one byte per `recv()`)**: 157 calls. Calls 1–65 and 67–156 extract nothing. Call 66 extracts `CONNECT` and call 157 extracts `MOVE`.
 
 ### 8.5 Full Session Transcript
 
-Alice connects, Bob joins, Alice wins game 1 on the diagonal, both ask for a rematch, and game 2 starts with Bob moving first.
+Alice connects and becomes Player 1, and Bob joins as Player 2. Alice wins game 1 on the diagonal. Five seconds later the server starts game 2 automatically, with Bob moving first.
 
 ```
 C1 → S     {"msg_type":"CONNECT","player_id":"Alice","timestamp":1727000000}
 S → C1     {"msg_type":"LOBBY_WAIT","player_id":"SERVER","payload":{"players_connected":1,"players_required":2,"message":"Waiting for an opponent..."},"timestamp":1727000000}
 C2 → S     {"msg_type":"CONNECT","player_id":"Bob","timestamp":1727000010}
-S → C1     {"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":1,"players":{"X":"Alice","O":"Bob"},"your_symbol":"X","first_turn":"Alice","scores":{"Alice":0,"Bob":0},"draws":0,"turn_timeout_s":60},"timestamp":1727000010}
-S → C2     {"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":1,"players":{"X":"Alice","O":"Bob"},"your_symbol":"O","first_turn":"Alice","scores":{"Alice":0,"Bob":0},"draws":0,"turn_timeout_s":60},"timestamp":1727000010}
-S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["","",""],["","",""],["","",""]],"current_turn":"Alice","move_number":0,"last_move":null},"timestamp":1727000010}
+S → C1     {"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":1,"your_role":"PLAYER_1","players":{"PLAYER_1":{"player_id":"Alice","symbol":"X"},"PLAYER_2":{"player_id":"Bob","symbol":"O"}},"first_turn":"Alice","turn_timeout_s":60},"timestamp":1727000010}
+S → C2     {"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":1,"your_role":"PLAYER_2","players":{"PLAYER_1":{"player_id":"Alice","symbol":"X"},"PLAYER_2":{"player_id":"Bob","symbol":"O"}},"first_turn":"Alice","turn_timeout_s":60},"timestamp":1727000010}
+S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["-","-","-"],["-","-","-"],["-","-","-"]],"current_turn":"Alice","move_number":0,"last_move":null,"scores":{"Alice":0,"Bob":0},"draws":0},"timestamp":1727000010}
 C1 → S     {"msg_type":"MOVE","player_id":"Alice","payload":{"row":1,"col":1},"timestamp":1727000015}
-S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["","",""],["","X",""],["","",""]],"current_turn":"Bob","move_number":1,"last_move":{"player_id":"Alice","symbol":"X","row":1,"col":1}},"timestamp":1727000015}
+S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["-","-","-"],["-","X","-"],["-","-","-"]],"current_turn":"Bob","move_number":1,"last_move":{"player_id":"Alice","symbol":"X","row":1,"col":1},"scores":{"Alice":0,"Bob":0},"draws":0},"timestamp":1727000015}
 C2 → S     {"msg_type":"MOVE","player_id":"Bob","payload":{"row":0,"col":1},"timestamp":1727000020}
-S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["","O",""],["","X",""],["","",""]],"current_turn":"Alice","move_number":2,"last_move":{"player_id":"Bob","symbol":"O","row":0,"col":1}},"timestamp":1727000020}
+S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["-","O","-"],["-","X","-"],["-","-","-"]],"current_turn":"Alice","move_number":2,"last_move":{"player_id":"Bob","symbol":"O","row":0,"col":1},"scores":{"Alice":0,"Bob":0},"draws":0},"timestamp":1727000020}
 C1 → S     {"msg_type":"MOVE","player_id":"Alice","payload":{"row":0,"col":0},"timestamp":1727000025}
-S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["X","O",""],["","X",""],["","",""]],"current_turn":"Bob","move_number":3,"last_move":{"player_id":"Alice","symbol":"X","row":0,"col":0}},"timestamp":1727000025}
+S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["X","O","-"],["-","X","-"],["-","-","-"]],"current_turn":"Bob","move_number":3,"last_move":{"player_id":"Alice","symbol":"X","row":0,"col":0},"scores":{"Alice":0,"Bob":0},"draws":0},"timestamp":1727000025}
 C2 → S     {"msg_type":"MOVE","player_id":"Bob","payload":{"row":0,"col":2},"timestamp":1727000030}
-S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["X","O","O"],["","X",""],["","",""]],"current_turn":"Alice","move_number":4,"last_move":{"player_id":"Bob","symbol":"O","row":0,"col":2}},"timestamp":1727000030}
+S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["X","O","O"],["-","X","-"],["-","-","-"]],"current_turn":"Alice","move_number":4,"last_move":{"player_id":"Bob","symbol":"O","row":0,"col":2},"scores":{"Alice":0,"Bob":0},"draws":0},"timestamp":1727000030}
 C1 → S     {"msg_type":"MOVE","player_id":"Alice","payload":{"row":2,"col":2},"timestamp":1727000035}
-S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["X","O","O"],["","X",""],["","","X"]],"current_turn":null,"move_number":5,"last_move":{"player_id":"Alice","symbol":"X","row":2,"col":2}},"timestamp":1727000035}
-S → C1,C2  {"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"WIN","winner":"Alice","winning_line":[[0,0],[1,1],[2,2]],"forfeit_reason":null,"scores":{"Alice":1,"Bob":0},"draws":0,"rematch_allowed":true},"timestamp":1727000035}
-C2 → S     {"msg_type":"REMATCH","player_id":"Bob","timestamp":1727000039}
-C1 → S     {"msg_type":"REMATCH","player_id":"Alice","timestamp":1727000041}
-S → C1     {"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":2,"players":{"X":"Alice","O":"Bob"},"your_symbol":"X","first_turn":"Bob","scores":{"Alice":1,"Bob":0},"draws":0,"turn_timeout_s":60},"timestamp":1727000041}
-S → C2     {"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":2,"players":{"X":"Alice","O":"Bob"},"your_symbol":"O","first_turn":"Bob","scores":{"Alice":1,"Bob":0},"draws":0,"turn_timeout_s":60},"timestamp":1727000041}
-S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["","",""],["","",""],["","",""]],"current_turn":"Bob","move_number":0,"last_move":null},"timestamp":1727000041}
+S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["X","O","O"],["-","X","-"],["-","-","X"]],"current_turn":null,"move_number":5,"last_move":{"player_id":"Alice","symbol":"X","row":2,"col":2},"scores":{"Alice":1,"Bob":0},"draws":0},"timestamp":1727000035}
+S → C1,C2  {"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"WIN","winner":"Alice","winning_line":[[0,0],[1,1],[2,2]],"forfeit_reason":null,"scores":{"Alice":1,"Bob":0},"draws":0,"next_game_in_s":5},"timestamp":1727000035}
+           [5 s pause: NEXT_GAME_DELAY_S]
+S → C1     {"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":2,"your_role":"PLAYER_1","players":{"PLAYER_1":{"player_id":"Alice","symbol":"X"},"PLAYER_2":{"player_id":"Bob","symbol":"O"}},"first_turn":"Bob","turn_timeout_s":60},"timestamp":1727000040}
+S → C2     {"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":2,"your_role":"PLAYER_2","players":{"PLAYER_1":{"player_id":"Alice","symbol":"X"},"PLAYER_2":{"player_id":"Bob","symbol":"O"}},"first_turn":"Bob","turn_timeout_s":60},"timestamp":1727000040}
+S → C1,C2  {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["-","-","-"],["-","-","-"],["-","-","-"]],"current_turn":"Bob","move_number":0,"last_move":null,"scores":{"Alice":1,"Bob":0},"draws":0},"timestamp":1727000040}
 ```
 
 **What Alice's socket actually receives** between `t=1727000000` and `t=1727000010`, as one continuous server→client stream. `GAME_START` and `STATE_UPDATE` are sent back-to-back, so they often arrive together in a single `recv()`:
 
 ```
-{"msg_type":"LOBBY_WAIT","player_id":"SERVER","payload":{"players_connected":1,"players_required":2,"message":"Waiting for an opponent..."},"timestamp":1727000000}\n{"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":1,"players":{"X":"Alice","O":"Bob"},"your_symbol":"X","first_turn":"Alice","scores":{"Alice":0,"Bob":0},"draws":0,"turn_timeout_s":60},"timestamp":1727000010}\n{"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["","",""],["","",""],["","",""]],"current_turn":"Alice","move_number":0,"last_move":null},"timestamp":1727000010}\n
+{"msg_type":"LOBBY_WAIT","player_id":"SERVER","payload":{"players_connected":1,"players_required":2,"message":"Waiting for an opponent..."},"timestamp":1727000000}\n{"msg_type":"GAME_START","player_id":"SERVER","payload":{"game_number":1,"your_role":"PLAYER_1","players":{"PLAYER_1":{"player_id":"Alice","symbol":"X"},"PLAYER_2":{"player_id":"Bob","symbol":"O"}},"first_turn":"Alice","turn_timeout_s":60},"timestamp":1727000010}\n{"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"board":[["-","-","-"],["-","-","-"],["-","-","-"]],"current_turn":"Alice","move_number":0,"last_move":null,"scores":{"Alice":0,"Bob":0},"draws":0},"timestamp":1727000010}\n
 ```
 
 ### 8.6 Error Exchanges
 
-**Name collision at `CONNECT` (not fatal, client retries):**
+**Alias collision at `CONNECT` (not fatal, client retries):**
 
 ```
 C2 → S     {"msg_type":"CONNECT","player_id":"Alice","timestamp":1727000008}
@@ -720,14 +933,30 @@ S → C2     {"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"NAME_TA
 C2 → S     {"msg_type":"CONNECT","player_id":"Bob","timestamp":1727000010}
 ```
 
-**Moving out of turn** (it is Alice's turn, `move_number` 0):
+**Newline in an alias, done correctly (`json.dumps`).** A client that skipped the input check sends the alias `Al⏎ice`. The serializer escapes the newline, so framing holds. In this line `\n` is the **two-byte escape `0x5C 0x6E`**, not a delimiter, so this is still **one** frame, and the server rejects the alias:
+
+```
+C2 → S     {"msg_type":"CONNECT","player_id":"Al\nice","timestamp":1727000008}
+S → C2     {"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"INVALID_NAME","message":"Alias must be 1-16 letters, digits, _ or -.","ref_msg_type":"CONNECT","fatal":false},"timestamp":1727000008}
+```
+
+**Newline in an alias, done wrong (string concatenation, which this protocol forbids).** The raw `0x0A` from the user's input reaches the wire and splits one message into two broken frames:
+
+```
+C2 → S     {"msg_type":"CONNECT","player_id":"Al                ← frame 1 ends at the raw 0x0A
+C2 → S     ice","timestamp":1727000008}                         ← frame 2
+S → C2     {"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"MALFORMED_JSON","message":"Line is not a valid JSON object.","ref_msg_type":null,"fatal":false},"timestamp":1727000008}
+S → C2     {"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"MALFORMED_JSON","message":"Line is not a valid JSON object.","ref_msg_type":null,"fatal":false},"timestamp":1727000008}
+```
+
+**Out-of-turn move** (it is Alice's turn, `move_number` 0):
 
 ```
 C2 → S     {"msg_type":"MOVE","player_id":"Bob","payload":{"row":0,"col":0},"timestamp":1727000012}
 S → C2     {"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"NOT_YOUR_TURN","message":"It is Alice's turn.","ref_msg_type":"MOVE","fatal":false},"timestamp":1727000012}
 ```
 
-**Occupied cell, out-of-bounds cell, and wrong field type** (Bob's turn, center already taken):
+**Invalid coordinates and wrong field type** (Bob's turn, center already taken):
 
 ```
 C2 → S     {"msg_type":"MOVE","player_id":"Bob","payload":{"row":1,"col":1},"timestamp":1727000017}
@@ -745,7 +974,7 @@ C2 → S     {"msg_type":"MOVE","player_id":"Alice","payload":{"row":2,"col":0},
 S → C2     {"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"PLAYER_ID_MISMATCH","message":"This connection is registered as 'Bob'.","ref_msg_type":"MOVE","fatal":false},"timestamp":1727000019}
 ```
 
-**Malformed JSON.** The line is terminated, so framing stays in sync and the next frame is processed normally:
+**Malformed message.** The line is terminated, so framing stays in sync and the next frame is processed normally:
 
 ```
 C2 → S     {"msg_type":"MOVE","player_id":"Bob","payload":{"row":0,
@@ -777,8 +1006,8 @@ All scenarios below happen during **game 1** of the Alice-vs-Bob match (scores 0
 
 ```
 C2 → S     {"msg_type":"DISCONNECT","player_id":"Bob","payload":{"reason":"Player quit"},"timestamp":1727000032}
-           [C2 closes its socket; server closes C2 socket]
-S → C1     {"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"FORFEIT","winner":"Alice","winning_line":null,"forfeit_reason":"DISCONNECT","scores":{"Alice":1,"Bob":0},"draws":0,"rematch_allowed":false},"timestamp":1727000032}
+           [C2 closes its socket; server closes C2 socket and sends nothing back to C2]
+S → C1     {"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"FORFEIT","winner":"Alice","winning_line":null,"forfeit_reason":"DISCONNECT","scores":{"Alice":1,"Bob":0},"draws":0,"next_game_in_s":null},"timestamp":1727000032}
 S → C1     {"msg_type":"LOBBY_WAIT","player_id":"SERVER","payload":{"players_connected":1,"players_required":2,"message":"Bob left the match. Waiting for a new opponent..."},"timestamp":1727000032}
 ```
 
@@ -788,7 +1017,7 @@ S → C1     {"msg_type":"LOBBY_WAIT","player_id":"SERVER","payload":{"players_c
 C2 → S     {"msg_type":"MOVE","player_id":"Bob","pay          ← partial frame, no 0x0A
            [TCP FIN or RST from C2: server recv() returns b"" or raises ConnectionResetError]
            [server discards the 41 buffered bytes, which are never parsed]
-S → C1     {"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"FORFEIT","winner":"Alice","winning_line":null,"forfeit_reason":"CONNECTION_LOST","scores":{"Alice":1,"Bob":0},"draws":0,"rematch_allowed":false},"timestamp":1727000027}
+S → C1     {"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"FORFEIT","winner":"Alice","winning_line":null,"forfeit_reason":"CONNECTION_LOST","scores":{"Alice":1,"Bob":0},"draws":0,"next_game_in_s":null},"timestamp":1727000027}
 S → C1     {"msg_type":"LOBBY_WAIT","player_id":"SERVER","payload":{"players_connected":1,"players_required":2,"message":"Bob left the match. Waiting for a new opponent..."},"timestamp":1727000027}
 ```
 
@@ -796,25 +1025,129 @@ S → C1     {"msg_type":"LOBBY_WAIT","player_id":"SERVER","payload":{"players_c
 
 ```
            [t=1727000025 … 1727000085: no bytes from C2]
-S → C2     {"msg_type":"DISCONNECT","player_id":"SERVER","payload":{"reason":"Turn timeout (60 s)"},"timestamp":1727000085}
+S → C2     {"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"TURN_TIMEOUT","message":"No move received within 60 s. You forfeit.","ref_msg_type":null,"fatal":true},"timestamp":1727000085}
            [server: shutdown(SHUT_WR), close C2 socket]
-S → C1     {"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"FORFEIT","winner":"Alice","winning_line":null,"forfeit_reason":"TIMEOUT","scores":{"Alice":1,"Bob":0},"draws":0,"rematch_allowed":false},"timestamp":1727000085}
+S → C1     {"msg_type":"GAME_OVER","player_id":"SERVER","payload":{"result":"FORFEIT","winner":"Alice","winning_line":null,"forfeit_reason":"TIMEOUT","scores":{"Alice":1,"Bob":0},"draws":0,"next_game_in_s":null},"timestamp":1727000085}
 S → C1     {"msg_type":"LOBBY_WAIT","player_id":"SERVER","payload":{"players_connected":1,"players_required":2,"message":"Bob left the match. Waiting for a new opponent..."},"timestamp":1727000085}
 ```
 
-**D. Leaving after the game ends (declining a rematch, which is not a forfeit).** Game 1 ended with Alice's win at `1727000035`:
+**D. Quitting between games (not a forfeit).** Game 1 ended with Alice's win at `1727000035`, and game 2 was due to start at `1727000040`:
 
 ```
-C2 → S     {"msg_type":"DISCONNECT","player_id":"Bob","payload":{"reason":"Declined rematch"},"timestamp":1727000038}
+C2 → S     {"msg_type":"DISCONNECT","player_id":"Bob","payload":{"reason":"Done playing"},"timestamp":1727000038}
+           [server cancels the next-game timer and closes C2 socket]
 S → C1     {"msg_type":"LOBBY_WAIT","player_id":"SERVER","payload":{"players_connected":1,"players_required":2,"message":"Bob left the match. Waiting for a new opponent..."},"timestamp":1727000038}
 ```
 
-No `GAME_OVER` is sent and the scores do not change, because the game had already ended.
+No `GAME_OVER` is sent and the scores do not change, because game 1 had already ended and game 2 never started.
 
 **E. Server shutdown:**
 
 ```
-S → C1     {"msg_type":"DISCONNECT","player_id":"SERVER","payload":{"reason":"Server shutting down"},"timestamp":1727000099}
-S → C2     {"msg_type":"DISCONNECT","player_id":"SERVER","payload":{"reason":"Server shutting down"},"timestamp":1727000099}
+S → C1     {"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"SERVER_SHUTDOWN","message":"Server is shutting down.","ref_msg_type":null,"fatal":true},"timestamp":1727000099}
+S → C2     {"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"SERVER_SHUTDOWN","message":"Server is shutting down.","ref_msg_type":null,"fatal":true},"timestamp":1727000099}
            [server closes both sockets and the listening socket]
 ```
+
+---
+
+## 9. AI Implementation Constraints
+
+AI coding assistants (e.g. Claude, ChatGPT, GitHub Copilot) may help write the client and server, but only as **constrained implementers of this blueprint**. Generic socket boilerplate, such as an echo server or a chat loop sending ad-hoc strings, does not implement this protocol and is not accepted. This section defines how prompts are written and how AI output is checked before it is used.
+
+### 9.1 Rules for Using AI
+
+1. **The blueprint is the source of truth.** Every prompt includes this document. If AI output disagrees with the blueprint, the code is fixed, not the spec. A protocol change is made here first, with a revision-history entry, before any code changes.
+2. **One module per prompt.** Each prompt covers one small module that maps to specific sections:
+
+   | Module | Implements |
+   |---|---|
+   | `framing.py` | §2.3, §2.4, §2.6 |
+   | `protocol.py` (message builders and validators) | §3, §4, §5 |
+   | `server.py` (room FSM, timers, forfeits) | §6, §7 |
+   | `client.py` (input and rendering loop) | §4 client behavior, §7.6 |
+
+   Small scopes make it practical to check every line against the spec.
+3. **Ask, don't guess.** The prompt tells the assistant to stop and ask when the blueprint does not cover a case, instead of inventing a message, field, or behavior.
+4. **Cite the spec in code.** Each AI-written function gets a comment naming the section it implements (e.g. `# §5.2 validation order`), so review against the blueprint is direct.
+5. **Keep a prompt log.** Each prompt, and every correction made to its output, is recorded in `docs/ai_prompt_log.md` as evidence of the process.
+
+### 9.2 Prompt Template
+
+Every code-generation prompt uses this template, with the blueprint attached:
+
+```text
+You are implementing one module of a networked Tic-Tac-Toe game (CS 457).
+The attached protocol_blueprint.md is the authoritative specification.
+Follow it exactly. Do not write generic socket boilerplate.
+
+MODULE:     <e.g. server.py: room state machine>
+IMPLEMENTS: <e.g. §6.2 transitions T1-T19 and §7 forfeit handling>
+
+HARD CONSTRAINTS
+1. Python 3 standard library only.
+2. Framing (§2): newline-delimited JSON. Use encode_frame, send_msg, and
+   FrameReader from §2.6 unchanged. One recv() is never one message:
+   coalescing and fragmentation are handled by the FrameReader buffer.
+3. Build every message as a dict and serialize it with
+   json.dumps(msg, separators=(",", ":")). Never use indent=, f-strings,
+   or string concatenation to build JSON.
+4. Message types (§4): exactly CONNECT, LOBBY_WAIT, GAME_START, MOVE,
+   STATE_UPDATE, ERROR, DISCONNECT, GAME_OVER. Do not add, rename, or remove
+   message types or payload fields. Field names, types, directions, and
+   allowed values must match the §4 tables exactly. Empty cells are "-".
+5. Validate incoming messages in the §5.2 order and reply with the exact
+   ERROR codes and fatal flags in §5.1.
+6. Server room logic implements the §6.2 transition table and nothing else.
+   Identity comes from the socket, never from the player_id field (§3.4).
+7. Validate aliases against PLAYER_ID_PATTERN on both client and server
+   (§2.5). Use the constants in §1.1; do not hard-code other values.
+8. All room state changes happen while holding one lock (§7.5).
+9. If the blueprint does not cover a case, stop and ask. Do not guess.
+
+OUTPUT
+- The code, with a comment above each function citing its blueprint section.
+- A list of any assumptions you made.
+```
+
+### 9.3 Review Checklist
+
+AI output is rejected and re-prompted, with the violated section quoted, if the code does any of the following:
+
+| Reject if the code... | Violates |
+|---|---|
+| Treats one `recv()` result as one message, or calls `json.loads` on raw `recv()` data | §2.2, §2.4 |
+| Builds JSON with `indent=`, f-strings, or string concatenation | §2.3, §2.5 |
+| Sends or accepts a `msg_type` or payload field not defined in §4 | §4 |
+| Sends `DISCONNECT` from the server, or broadcasts an `ERROR` | §4.6, §4.7 |
+| Trusts the `player_id` field instead of the socket's registered identity | §3.4 |
+| Skips or reorders validation steps, or returns a different error code | §5.1, §5.2 |
+| Adds, skips, or changes a state transition | §6.2 |
+| Sends `GAME_START` without the `STATE_UPDATE` that must follow it | §6.4 |
+| Changes room state without holding the game lock | §7.5 |
+| Accepts an alias without checking `PLAYER_ID_PATTERN` | §2.5, §3.2 |
+| Uses `isinstance(v, int)` to validate integer fields | §3.2 |
+| Lets a client change its own board instead of rendering `STATE_UPDATE` | §1 |
+
+### 9.4 Conformance Tests
+
+The examples in §8 double as test vectors. AI-generated code is accepted only after it passes these tests:
+
+| Test | Input | Pass condition |
+|---|---|---|
+| Framing | The §8.2 stream fed to `FrameReader` in the splits of §8.4 cases A–D | Exactly two messages, `CONNECT` then `MOVE`, in every case |
+| Encoding | Every message dict from §4 | `encode_frame()` produces one line ending in a single `0x0A` that decodes to the same object as the §4 "Wire form" |
+| Alias safety | `CONNECT` with alias `"Al\nice"` | Client refuses to send it. If it is sent anyway, the frame count is 1 and the reply is `INVALID_NAME` (§8.6). |
+| Full session | Client lines of §8.5 replayed by two scripted clients, with game 1's `first_turn` fixed to Alice | Server lines match §8.5 exactly, except for `timestamp` values |
+| Errors | Each exchange in §8.6 | Same `code` and `fatal` values |
+| Forfeits | Scenarios A–E in §8.7 | Same messages to the remaining player, and the departing socket is closed |
+
+---
+
+## 10. Revision History
+
+| Version | Date | Changes |
+|---|---|---|
+| 1.0 | 2026-10-04 | Initial blueprint: newline-delimited JSON framing, message catalog, forfeit management, wire examples. |
+| 1.1 | 2026-10-04 | Aligned the message set with the required eight message types. `GAME_START` now assigns roles (`PLAYER_1` / `PLAYER_2`). `STATE_UPDATE` now carries `scores` and `draws`. `DISCONNECT` is Client → Server only; server-initiated closes use fatal `ERROR` codes (`TURN_TIMEOUT`, `SERVER_SHUTDOWN`). `REMATCH` was removed: the next game starts automatically after `NEXT_GAME_DELAY_S`, and `GAME_OVER.rematch_allowed` was replaced by `next_game_in_s`. |
+| 1.2 | 2026-10-04 | Mapped the document to the Sprint 1 instructions with a requirements traceability table. §2 renamed to *Transport Layer & Packet Framing Mechanism*, with a transport/serialization summary, the reasons for choosing Option A, and explicit coalescing and fragmentation handling. **Wire change:** empty board cells are now `"-"` instead of `""`. Added newline-in-alias safeguards (§2.5) with wire examples (§8.6), the FSM transition table (§6.2), and AI implementation constraints (§9). |

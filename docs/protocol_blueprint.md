@@ -10,6 +10,7 @@
 | **Serialization** | JSON, UTF-8 |
 | **Framing** | Option A: newline-delimited JSON (`\n`, byte `0x0A`) |
 | **SOW reference** | §2 Application-Layer Messaging Protocol Blueprint (Sprint 1) |
+| **Companion documents** | [`fsm_specification.md`](fsm_specification.md) (server state machine) · [`ai_prompts.md`](ai_prompts.md) (AI prompting & constraint strategy) |
 
 ---
 
@@ -20,17 +21,25 @@
 3. [Common Message Envelope & Data Types](#3-common-message-envelope--data-types)
 4. [Message Structures](#4-message-structures)
 5. [Error Codes & Validation Order](#5-error-codes--validation-order)
-6. [Session State Machine](#6-session-state-machine)
+6. [Game State Machine (summary)](#6-game-state-machine-summary)
 7. [Disconnect & Forfeit Management](#7-disconnect--forfeit-management)
 8. [Wire Examples](#8-wire-examples)
-9. [AI Implementation Constraints](#9-ai-implementation-constraints)
+9. [AI Prompting & Constraint Strategy (summary)](#9-ai-prompting--constraint-strategy-summary)
 10. [Revision History](#10-revision-history)
+
+### Sprint 1 Deliverables
+
+| # | Deliverable | File |
+|---|---|---|
+| 1 | Application Protocol Blueprint | `docs/protocol_blueprint.md` (this file) |
+| 2 | Game State Machine (FSM) Specification | [`docs/fsm_specification.md`](fsm_specification.md) |
+| 3 | AI Prompting & Constraint Strategy | [`docs/ai_prompts.md`](ai_prompts.md) |
 
 ### Sprint 1 Requirements Traceability
 
 | Sprint 1 requirement | Where it is met |
 |---|---|
-| Design the protocol and FSM before writing application code | This entire document; FSM in [§6](#6-session-state-machine) |
+| Design the protocol and FSM before writing application code | This document and [`fsm_specification.md`](fsm_specification.md) |
 | **2.1** Transport protocol: TCP | [§2.1](#21-transport--serialization) |
 | **2.1** Serialization format: structured JSON | [§2.1](#21-transport--serialization), [§3](#3-common-message-envelope--data-types) |
 | **2.1** Deterministic framing rule that handles coalescing and fragmentation | [§2.2](#22-the-framing-rule)–[§2.4](#24-receiver-rules); worked cases in [§8.4](#84-coalescing--fragmentation-how-the-receiver-buffer-evolves) |
@@ -38,8 +47,10 @@
 | **2.1** JSON schema / structure specification (`MOVE`) | [§3.1](#31-envelope), [§4.4](#44-move) |
 | **2.2** Exact message structures for all eight message types | [§4](#4-message-structures) |
 | Explicit message schemas | [§3](#3-common-message-envelope--data-types), [§4](#4-message-structures) |
-| Explicit state transitions | [§6.1](#61-room-states-sow-23) (diagram), [§6.2](#62-state-transition-table) (table) |
-| Show how AI assistants are prompted and constrained to follow this blueprint | [§9](#9-ai-implementation-constraints) |
+| Complete field specifications and data types for all message types, including `DISCONNECT` / forfeit management | [§3](#3-common-message-envelope--data-types), [§4](#4-message-structures), [§7](#7-disconnect--forfeit-management) |
+| **2.3** Server-side FSM in Mermaid `stateDiagram-v2`: valid moves, invalid moves, disconnects | [`fsm_specification.md`](fsm_specification.md) (summary in [§6](#6-game-state-machine-summary)) |
+| **2.4** Connection termination & socket lifecycle | [§7](#7-disconnect--forfeit-management) (protocol behavior), [`fsm_specification.md` §5](fsm_specification.md#5-connection-termination--socket-lifecycle) (detection and handling) |
+| Show how AI assistants are prompted and constrained to follow this blueprint | [`ai_prompts.md`](ai_prompts.md) |
 
 ---
 
@@ -673,7 +684,7 @@ The server never sends `DISCONNECT`. When the server itself ends a connection (t
 | Identity / registration | `INVALID_NAME` | No | `CONNECT` alias fails `PLAYER_ID_PATTERN` or is `SERVER` |
 | Identity / registration | `NAME_TAKEN` | No | `CONNECT` alias is already used by the other player |
 | Identity / registration | `ROOM_FULL` | **Yes** | `CONNECT` when two players are already registered |
-| Wrong state | `UNEXPECTED_MESSAGE` | No | Valid message that is not allowed in the current state (see §6.3) |
+| Wrong state | `UNEXPECTED_MESSAGE` | No | Valid message that is not allowed in the current state (see §6.2) |
 | Server-initiated close | `TURN_TIMEOUT` | **Yes** | Active player sent no accepted `MOVE` within `TURN_TIMEOUT_S` (§7.4) |
 | Server-initiated close | `SERVER_SHUTDOWN` | **Yes** | Server is shutting down |
 
@@ -687,7 +698,7 @@ The server applies these checks in order and stops at the first failure:
 2. `msg_type` is a known client→server type (`CONNECT`, `MOVE`, `DISCONNECT`) → `UNKNOWN_MSG_TYPE`
 3. Envelope fields are present and correctly typed → `INVALID_FIELD`
 4. `player_id` matches the socket's registered alias (skipped before `CONNECT`) → `PLAYER_ID_MISMATCH`
-5. Message is allowed in the current state (§6.3) → `UNEXPECTED_MESSAGE`
+5. Message is allowed in the current state (§6.2) → `UNEXPECTED_MESSAGE`
 6. Payload fields are present and correctly typed → `INVALID_FIELD`
 7. *(MOVE only)* Sender is `current_turn` → `NOT_YOUR_TURN`
 8. *(MOVE only)* `0 ≤ row ≤ 2` and `0 ≤ col ≤ 2` → `OUT_OF_BOUNDS`
@@ -696,56 +707,17 @@ The server applies these checks in order and stops at the first failure:
 
 ---
 
-## 6. Session State Machine
+## 6. Game State Machine (summary)
 
-### 6.1 Room States (SOW §2.3)
+The server-side state engine is specified in full in **[`fsm_specification.md`](fsm_specification.md)**. That file has the Mermaid `stateDiagram-v2` diagrams, the T1–T21 transition table, per-state handling logic, valid and invalid move handling, and connection termination. This section keeps only the protocol-level rules a client can observe.
 
-```mermaid
-stateDiagram-v2
-    [*] --> INIT
-    INIT --> WAITING_FOR_PLAYERS : socket bound and listening
-    WAITING_FOR_PLAYERS --> WAITING_FOR_PLAYERS : 1st CONNECT / LOBBY_WAIT
-    WAITING_FOR_PLAYERS --> PLAYER_TURN : 2nd CONNECT / GAME_START + STATE_UPDATE
-    PLAYER_TURN --> EVALUATE_MOVE : MOVE received
-    EVALUATE_MOVE --> PLAYER_TURN : rejected / ERROR to sender
-    EVALUATE_MOVE --> CHECK_WIN_DRAW : accepted / board updated
-    CHECK_WIN_DRAW --> PLAYER_TURN : no result / STATE_UPDATE
-    CHECK_WIN_DRAW --> GAME_OVER : win or draw / STATE_UPDATE + GAME_OVER
-    PLAYER_TURN --> GAME_OVER : player leaves or times out / GAME_OVER FORFEIT
-    GAME_OVER --> PLAYER_TURN : next-game delay elapsed / GAME_START + STATE_UPDATE
-    GAME_OVER --> CLEANUP : forfeit, or a player leaves between games
-    CLEANUP --> WAITING_FOR_PLAYERS : reset match / LOBBY_WAIT to remaining player
-```
+### 6.1 States at a Glance
 
-`EVALUATE_MOVE` and `CHECK_WIN_DRAW` are internal steps that pass immediately. While the game is in progress, the room is waiting in `PLAYER_TURN`. After a win or draw, the room stays in `GAME_OVER` for `NEXT_GAME_DELAY_S` and then starts the next game. A server shutdown can happen in any state (§7.2).
+`INIT` → `WAITING_FOR_PLAYERS` → `GAME_START` → `PLAYER_TURN` ⇄ `EVALUATE_MOVE` → `CHECK_WIN_DRAW` → `GAME_OVER` → `GAME_START` (next game) or `CLEANUP` → `WAITING_FOR_PLAYERS`.
 
-### 6.2 State Transition Table
+Events are only received in `WAITING_FOR_PLAYERS`, `PLAYER_TURN`, and `GAME_OVER`. The other states are transient steps inside a single event ([FSM §1.1](fsm_specification.md#11-states)).
 
-This table is the normative form of the diagram above. The server implementation handles exactly these transitions. Any client message not covered here is rejected as described in §6.3. **P** is the player who triggered the event and **Q** is the opponent.
-
-| # | Current state | Event | Guard | Actions (messages sent, state changes) | Next state |
-|---|---|---|---|---|---|
-| T1 | `INIT` | Server starts | Listening socket bound on `DEFAULT_PORT` | Clear room: no players, scores reset, `game_number` = 0 | `WAITING_FOR_PLAYERS` |
-| T2 | `WAITING_FOR_PLAYERS` | `CONNECT` | Room empty; alias valid | Register P as `PLAYER_1` (X). `LOBBY_WAIT` → P. | `WAITING_FOR_PLAYERS` |
-| T3 | `WAITING_FOR_PLAYERS` | `CONNECT` | One player waiting; alias valid and not taken | Register P as `PLAYER_2` (O). `game_number` = 1. Pick `first_turn` at random. Clear the board. `GAME_START` → each player, then `STATE_UPDATE` → both. Start turn timer. | `PLAYER_TURN` |
-| T4 | `WAITING_FOR_PLAYERS` | Waiting player leaves | — | Close P's socket. Free alias. | `WAITING_FOR_PLAYERS` (empty) |
-| T5 | `PLAYER_TURN` | `MOVE` | — | Run validation (§5.2) | `EVALUATE_MOVE` |
-| T6 | `EVALUATE_MOVE` | Validation fails | — | `ERROR` (non-fatal) → P. Board, turn, and turn timer unchanged. | `PLAYER_TURN` |
-| T7 | `EVALUATE_MOVE` | Validation passes | — | Place P's symbol. `move_number` += 1. | `CHECK_WIN_DRAW` |
-| T8 | `CHECK_WIN_DRAW` | No result | No three-in-a-row; board not full | `current_turn` = Q. Restart turn timer. `STATE_UPDATE` → both. | `PLAYER_TURN` |
-| T9 | `CHECK_WIN_DRAW` | Win | P has three in a row | P's score += 1. Stop turn timer. `STATE_UPDATE` (`current_turn: null`) → both, then `GAME_OVER` (`WIN`) → both. Start next-game timer. | `GAME_OVER` |
-| T10 | `CHECK_WIN_DRAW` | Draw | Board full; no three-in-a-row | `draws` += 1. Stop turn timer. `STATE_UPDATE` (`current_turn: null`) → both, then `GAME_OVER` (`DRAW`) → both. Start next-game timer. | `GAME_OVER` |
-| T11 | `PLAYER_TURN` | P leaves (`DISCONNECT`, EOF, socket error, fatal `ERROR`) | Either player's turn | Close P's socket. Stop turn timer. Q's score += 1. `GAME_OVER` (`FORFEIT`, `next_game_in_s: null`) → Q. | `CLEANUP` |
-| T12 | `PLAYER_TURN` | Turn timer expires | — | `ERROR TURN_TIMEOUT` (fatal) → active player P, then close P's socket. Q's score += 1. `GAME_OVER` (`FORFEIT`, `TIMEOUT`) → Q. | `CLEANUP` |
-| T13 | `GAME_OVER` | Next-game timer expires | Both players still connected | `game_number` += 1. `first_turn` = the player who did not move first last game. Clear the board. `GAME_START` → each player, then `STATE_UPDATE` → both. Start turn timer. | `PLAYER_TURN` |
-| T14 | `GAME_OVER` | P leaves | — | Cancel next-game timer. Close P's socket. | `CLEANUP` |
-| T15 | `CLEANUP` | (immediate) | Q still connected | Reset match: scores 0, `draws` 0, `game_number` 0. Q becomes `PLAYER_1`. `LOBBY_WAIT` → Q. | `WAITING_FOR_PLAYERS` |
-| T16 | `CLEANUP` | (immediate) | No players left | Reset match | `WAITING_FOR_PLAYERS` (empty) |
-| T17 | `PLAYER_TURN`, `GAME_OVER` | `CONNECT` from a new socket | Two players registered | `ERROR ROOM_FULL` (fatal) → new socket, then close it | unchanged |
-| T18 | any | `CONNECT` with an invalid or taken alias | — | `ERROR INVALID_NAME` / `NAME_TAKEN` (non-fatal) → sender. The sender may retry. | unchanged |
-| T19 | any | Server shutdown | — | `ERROR SERVER_SHUTDOWN` (fatal) → every registered player. Close all sockets. | *(terminated)* |
-
-### 6.3 Allowed Client Messages per State
+### 6.2 Allowed Client Messages per State
 
 | Client sends | Socket not yet registered | `WAITING_FOR_PLAYERS` (in lobby) | `PLAYER_TURN` (game running) | `GAME_OVER` (between games) |
 |---|---|---|---|---|
@@ -753,13 +725,13 @@ This table is the normative form of the diagram above. The server implementation
 | `MOVE` | `UNEXPECTED_MESSAGE` | `UNEXPECTED_MESSAGE` | Validate (§5.2) | `UNEXPECTED_MESSAGE` |
 | `DISCONNECT` | Close socket | Remove player; room is empty | **Forfeit** (§7) | Remove player; cancel the next game; opponent goes back to the lobby |
 
-### 6.4 Server Send-Order Guarantees
+### 6.3 Server Send-Order Guarantees
 
 1. `GAME_START` is always followed immediately by `STATE_UPDATE` with `move_number: 0`.
 2. A game-ending move produces `STATE_UPDATE` (`current_turn: null`) and then `GAME_OVER`, in that order.
 3. After a `WIN`/`DRAW` `GAME_OVER`, the next message from the server is `GAME_START`, sent `NEXT_GAME_DELAY_S` later. The only exception is when the opponent leaves first, in which case it is `LOBBY_WAIT`.
 4. A forfeit produces `GAME_OVER` (`FORFEIT`) and then `LOBBY_WAIT`, sent to the remaining player.
-5. Broadcasts are sent to both players while holding the game lock, so both players see the same sequence of states.
+5. Each event runs to completion before the next one is handled ([FSM §6](fsm_specification.md#6-run-to-completion-rules--race-conditions)), so both players see the same sequence of states.
 
 ---
 
@@ -776,6 +748,25 @@ This table is the normative form of the diagram above. The server implementation
 | 5 | Silent peer (CML node powered off, link down, client hung) | `TURN_TIMEOUT_S` expires with no accepted `MOVE` from the active player. The server sends `ERROR TURN_TIMEOUT` (fatal). | `"TIMEOUT"` |
 
 Trigger 5 is needed because TCP sends nothing when a host disappears without sending FIN or RST. Without an application-level timer, the server would wait forever for that player's move.
+
+**Graceful vs. abrupt termination.** A *graceful* exit is an application-layer `DISCONNECT` followed by `close()`, which starts the TCP FIN 4-way teardown (trigger 1). A process that exits without sending `DISCONNECT` still produces a FIN (trigger 2). An *abrupt* termination is a crash with unread data, which produces RST (trigger 3), or a network drop such as a powered-off CML node or a cut router link, which produces no packets at all (trigger 5).
+
+**The TCP 0-byte EOF rule.** When the peer closes cleanly, `recv()` does not raise an exception. It returns `b""`. Every receive loop must check `if not data: break`. Without that check the loop spins forever at 100% CPU, because every later `recv()` returns `b""` immediately. On EOF, any partial frame left in the buffer is discarded (§2.4 rule 7).
+
+**Socket exceptions.** `ConnectionResetError` (RST from the peer), `BrokenPipeError` (writing to a socket whose peer has closed), `ConnectionAbortedError`, and `TimeoutError` are all caught in the receive loop and in the send helper. Each one turns into a player departure (forfeit if a game is running) instead of crashing the server:
+
+```python
+try:
+    data = sock.recv(4096)
+    if not data:                                  # 0-byte EOF: peer sent FIN
+        handle_departure(player, "CONNECTION_LOST")
+        return
+    ...                                           # feed FrameReader, dispatch frames
+except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, TimeoutError):
+    handle_departure(player, "CONNECTION_LOST")   # RST or network drop
+```
+
+The complete, tested session loop, the socket lifecycle diagram, and the full exception table are in [FSM §5](fsm_specification.md#5-connection-termination--socket-lifecycle).
 
 ### 7.2 Server Action by State
 
@@ -799,7 +790,7 @@ In every case the server stops sending to P, closes P's socket, and frees P's al
 
 **Server ending a connection (timeout, shutdown, protocol violation):**
 1. Send `ERROR` with `fatal: true` and the matching `code`, using `sendall()`.
-2. Call `sock.shutdown(socket.SHUT_WR)` and then `close()`. This sends FIN after the final message, so the client can read it before it sees EOF.
+2. Call `sock.shutdown(socket.SHUT_RDWR)`. This sends FIN after the final message, so the client can read it before it sees EOF. It also wakes the server's own blocked `recv()` on that socket, so the session loop closes the socket through its normal cleanup ([FSM §5.4](fsm_specification.md#54-socket-lifecycle-diagram)).
 
 **Rule:** the server never closes a registered player's socket without first sending a fatal `ERROR` explaining why, unless that player has already disconnected.
 
@@ -814,11 +805,7 @@ In every case the server stops sending to P, closes P's socket, and frees P's al
 
 ### 7.5 Concurrency & Races
 
-- All state changes (moves, forfeits, timer expiry, starting the next game) happen while holding **one game lock**. Events are handled one at a time, in the order they acquire the lock.
-- **Move vs. disconnect race:** if P's winning `MOVE` is handled first, the game ends as `WIN`. P's later EOF then happens in `GAME_OVER`, so it is not a forfeit. If the EOF is handled first, P forfeits and any later bytes from P are never read.
-- **Disconnect vs. next-game timer:** if P's `DISCONNECT` or EOF is handled before the timer fires, the next game is canceled and Q gets `LOBBY_WAIT`. If the timer fires first, the next game starts and P's departure becomes a forfeit of that new game.
-- **Both players leave together:** the first departure handled produces the forfeit. By the time the second one is handled, the room is in `CLEANUP`/`WAITING_FOR_PLAYERS`, so nothing more is sent (there is no one to send to). The room resets to empty.
-- **Truncated frame at EOF:** if P's process dies in the middle of a `MOVE` (some bytes received, no `\n`), the partial frame is discarded (§2.4 rule 7). Only complete frames are ever acted on.
+Events are processed one at a time, to completion. Races such as a winning move arriving together with a disconnect, or a disconnect arriving as the next-game timer fires, are resolved in [FSM §6](fsm_specification.md#6-run-to-completion-rules--race-conditions). One protocol-level consequence: if P's process dies in the middle of a `MOVE` (some bytes received, no `\n`), the partial frame is discarded (§2.4 rule 7). Only complete frames are ever acted on.
 
 ### 7.6 Client-Side Handling of Server Loss
 
@@ -1051,96 +1038,14 @@ S → C2     {"msg_type":"ERROR","player_id":"SERVER","payload":{"code":"SERVER_
 
 ---
 
-## 9. AI Implementation Constraints
+## 9. AI Prompting & Constraint Strategy (summary)
 
-AI coding assistants (e.g. Claude, ChatGPT, GitHub Copilot) may help write the client and server, but only as **constrained implementers of this blueprint**. Generic socket boilerplate, such as an echo server or a chat loop sending ad-hoc strings, does not implement this protocol and is not accepted. This section defines how prompts are written and how AI output is checked before it is used.
+How AI coding tools are prompted and constrained to implement this blueprint exactly is documented in **[`ai_prompts.md`](ai_prompts.md)**. It contains:
 
-### 9.1 Rules for Using AI
-
-1. **The blueprint is the source of truth.** Every prompt includes this document. If AI output disagrees with the blueprint, the code is fixed, not the spec. A protocol change is made here first, with a revision-history entry, before any code changes.
-2. **One module per prompt.** Each prompt covers one small module that maps to specific sections:
-
-   | Module | Implements |
-   |---|---|
-   | `framing.py` | §2.3, §2.4, §2.6 |
-   | `protocol.py` (message builders and validators) | §3, §4, §5 |
-   | `server.py` (room FSM, timers, forfeits) | §6, §7 |
-   | `client.py` (input and rendering loop) | §4 client behavior, §7.6 |
-
-   Small scopes make it practical to check every line against the spec.
-3. **Ask, don't guess.** The prompt tells the assistant to stop and ask when the blueprint does not cover a case, instead of inventing a message, field, or behavior.
-4. **Cite the spec in code.** Each AI-written function gets a comment naming the section it implements (e.g. `# §5.2 validation order`), so review against the blueprint is direct.
-5. **Keep a prompt log.** Each prompt, and every correction made to its output, is recorded in `docs/ai_prompt_log.md` as evidence of the process.
-
-### 9.2 Prompt Template
-
-Every code-generation prompt uses this template, with the blueprint attached:
-
-```text
-You are implementing one module of a networked Tic-Tac-Toe game (CS 457).
-The attached protocol_blueprint.md is the authoritative specification.
-Follow it exactly. Do not write generic socket boilerplate.
-
-MODULE:     <e.g. server.py: room state machine>
-IMPLEMENTS: <e.g. §6.2 transitions T1-T19 and §7 forfeit handling>
-
-HARD CONSTRAINTS
-1. Python 3 standard library only.
-2. Framing (§2): newline-delimited JSON. Use encode_frame, send_msg, and
-   FrameReader from §2.6 unchanged. One recv() is never one message:
-   coalescing and fragmentation are handled by the FrameReader buffer.
-3. Build every message as a dict and serialize it with
-   json.dumps(msg, separators=(",", ":")). Never use indent=, f-strings,
-   or string concatenation to build JSON.
-4. Message types (§4): exactly CONNECT, LOBBY_WAIT, GAME_START, MOVE,
-   STATE_UPDATE, ERROR, DISCONNECT, GAME_OVER. Do not add, rename, or remove
-   message types or payload fields. Field names, types, directions, and
-   allowed values must match the §4 tables exactly. Empty cells are "-".
-5. Validate incoming messages in the §5.2 order and reply with the exact
-   ERROR codes and fatal flags in §5.1.
-6. Server room logic implements the §6.2 transition table and nothing else.
-   Identity comes from the socket, never from the player_id field (§3.4).
-7. Validate aliases against PLAYER_ID_PATTERN on both client and server
-   (§2.5). Use the constants in §1.1; do not hard-code other values.
-8. All room state changes happen while holding one lock (§7.5).
-9. If the blueprint does not cover a case, stop and ask. Do not guess.
-
-OUTPUT
-- The code, with a comment above each function citing its blueprint section.
-- A list of any assumptions you made.
-```
-
-### 9.3 Review Checklist
-
-AI output is rejected and re-prompted, with the violated section quoted, if the code does any of the following:
-
-| Reject if the code... | Violates |
-|---|---|
-| Treats one `recv()` result as one message, or calls `json.loads` on raw `recv()` data | §2.2, §2.4 |
-| Builds JSON with `indent=`, f-strings, or string concatenation | §2.3, §2.5 |
-| Sends or accepts a `msg_type` or payload field not defined in §4 | §4 |
-| Sends `DISCONNECT` from the server, or broadcasts an `ERROR` | §4.6, §4.7 |
-| Trusts the `player_id` field instead of the socket's registered identity | §3.4 |
-| Skips or reorders validation steps, or returns a different error code | §5.1, §5.2 |
-| Adds, skips, or changes a state transition | §6.2 |
-| Sends `GAME_START` without the `STATE_UPDATE` that must follow it | §6.4 |
-| Changes room state without holding the game lock | §7.5 |
-| Accepts an alias without checking `PLAYER_ID_PATTERN` | §2.5, §3.2 |
-| Uses `isinstance(v, int)` to validate integer fields | §3.2 |
-| Lets a client change its own board instead of rendering `STATE_UPDATE` | §1 |
-
-### 9.4 Conformance Tests
-
-The examples in §8 double as test vectors. AI-generated code is accepted only after it passes these tests:
-
-| Test | Input | Pass condition |
-|---|---|---|
-| Framing | The §8.2 stream fed to `FrameReader` in the splits of §8.4 cases A–D | Exactly two messages, `CONNECT` then `MOVE`, in every case |
-| Encoding | Every message dict from §4 | `encode_frame()` produces one line ending in a single `0x0A` that decodes to the same object as the §4 "Wire form" |
-| Alias safety | `CONNECT` with alias `"Al\nice"` | Client refuses to send it. If it is sent anyway, the frame count is 1 and the reply is `INVALID_NAME` (§8.6). |
-| Full session | Client lines of §8.5 replayed by two scripted clients, with game 1's `first_turn` fixed to Alice | Server lines match §8.5 exactly, except for `timestamp` values |
-| Errors | Each exchange in §8.6 | Same `code` and `fatal` values |
-| Forfeits | Scenarios A–E in §8.7 | Same messages to the remaining player, and the departing socket is closed |
+- the **system prompt**, including a schema card of every message's exact fields, types, and key order;
+- **task prompts** with fixed function signatures for the parser and serialization functions (`protocol.py`), tests, server, and client;
+- a correction prompt, a review checklist, and acceptance tests built from the wire examples in §4 and §8;
+- a prompt log.
 
 ---
 
@@ -1151,3 +1056,4 @@ The examples in §8 double as test vectors. AI-generated code is accepted only a
 | 1.0 | 2026-10-04 | Initial blueprint: newline-delimited JSON framing, message catalog, forfeit management, wire examples. |
 | 1.1 | 2026-10-04 | Aligned the message set with the required eight message types. `GAME_START` now assigns roles (`PLAYER_1` / `PLAYER_2`). `STATE_UPDATE` now carries `scores` and `draws`. `DISCONNECT` is Client → Server only; server-initiated closes use fatal `ERROR` codes (`TURN_TIMEOUT`, `SERVER_SHUTDOWN`). `REMATCH` was removed: the next game starts automatically after `NEXT_GAME_DELAY_S`, and `GAME_OVER.rematch_allowed` was replaced by `next_game_in_s`. |
 | 1.2 | 2026-10-04 | Mapped the document to the Sprint 1 instructions with a requirements traceability table. §2 renamed to *Transport Layer & Packet Framing Mechanism*, with a transport/serialization summary, the reasons for choosing Option A, and explicit coalescing and fragmentation handling. **Wire change:** empty board cells are now `"-"` instead of `""`. Added newline-in-alias safeguards (§2.5) with wire examples (§8.6), the FSM transition table (§6.2), and AI implementation constraints (§9). |
+| 1.2 | 2026-10-04 | Documentation split into the three Sprint 1 deliverables (protocol unchanged). FSM diagrams, transition table, and termination handling moved to `fsm_specification.md`; §6 is now a summary that keeps the client-observable rules. AI strategy moved to `ai_prompts.md`; §9 is now a summary. §7.3 now uses `shutdown(SHUT_RDWR)`. |

@@ -236,7 +236,7 @@ regenerate expected values by calling the code under test.
 ```text
 TASK: Write server.py: the game engine and client sessions.
 IMPLEMENTS: fsm_specification.md §1 to §6 (states, transitions T1-T21, session loop
-            in fsm §5.5)
+            in fsm §5.5) and concurrency_design.md §3-§7 (threads, locking, broadcast)
             and blueprint §7 (disconnect and forfeit management).
 
 Rules:
@@ -244,8 +244,10 @@ Rules:
 - Room data changes ONLY inside transitions T1-T21. Each transition is one method or branch,
   commented with its T-number. No other transitions exist.
 - Every connection runs client_session() from fsm §5.5 unchanged.
-- Concurrency model: <FILL IN FROM SPRINT 2: threading + one threading.Lock, or selectors>.
-  Either way, each event runs to completion before the next one (fsm §6).
+- Concurrency model (concurrency_design.md §2-§4): one daemon threading.Thread per client
+  socket, plus ONE threading.Lock (room.lock) guarding every Room field. Each public Room
+  method is exactly one `with self.lock:` block. Never hold the lock across recv(); always
+  hold it across sendall(). Each event runs to completion before the next one (fsm §6).
 - Timers only post TURN_TIMEOUT / NEXT_GAME_TIMER events; they never change room data.
 - All sending goes through one send helper that catches OSError and queues
   CLIENT_DISCONNECTED for that player (fsm §5.3). Server-initiated closes send a fatal ERROR,
@@ -353,3 +355,4 @@ Each time a prompt from §3 is used, record it here. Note what the AI got wrong 
 | Version | Date | Changes |
 |---|---|---|
 | 1.0 | 2026-10-04 | Initial AI strategy: system prompt with schema card; task prompts for serialization, parsing and validation, tests, server, and client; correction prompt; review checklist; acceptance tests; prompt log. Replaces blueprint §9 (v1.2). |
+| 1.1 | 2026-10-18 | Server engine prompt (§3.4) now specifies the Sprint 2 concurrency model: thread per client plus one `threading.Lock`, per `concurrency_design.md`. |

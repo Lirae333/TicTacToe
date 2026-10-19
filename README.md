@@ -9,3 +9,10 @@ A two-player, console-based Tic-Tac-Toe game played over TCP. One server hosts t
 | Application Protocol Blueprint (message schemas, `\n` framing, wire examples, disconnect/forfeit handling) | [`docs/protocol_blueprint.md`](docs/protocol_blueprint.md) |
 | Game State Machine Specification (Mermaid `stateDiagram-v2`, transitions, connection termination) | [`docs/fsm_specification.md`](docs/fsm_specification.md) |
 | AI Prompting & Constraint Strategy | [`docs/ai_prompts.md`](docs/ai_prompts.md) |
+
+## Sprint 2: Game Behavior & Server Concurrency Architecture
+
+| Deliverable | File |
+|---|---|
+| Concurrency Architecture Document (thread-per-client model, connection lifecycle, `threading.Lock` strategy, score synchronization) | [`docs/concurrency_design.md`](docs/concurrency_design.md) |
+| State & Score Broadcast Sequence Diagrams (Mermaid `sequenceDiagram`, embedded) | [`docs/concurrency_design.md` §5–§6](docs/concurrency_design.md#5-client-state--turn-synchronization) |

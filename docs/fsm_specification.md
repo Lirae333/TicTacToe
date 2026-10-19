@@ -398,7 +398,7 @@ The wire-level transcripts for each case are in B§8.7.
 
 ## 6. Run-to-Completion Rules & Race Conditions
 
-The engine processes **one event at a time to completion**. With threads this means one lock held for the whole event; with a `selectors` loop it holds naturally (concurrency model chosen in Sprint 2).
+The engine processes **one event at a time to completion**. Sprint 2 chose threads: each event runs inside one critical section of `room.lock`, the single `threading.Lock` that guards all room data. The threads, critical sections, and locking rules are specified in [`concurrency_design.md`](concurrency_design.md#4-thread-safety--lock-acquisition-strategy).
 
 1. **Atomic events.** An event and every transient state it passes through (`GAME_START`, `EVALUATE_MOVE`, `CHECK_WIN_DRAW`, `CLEANUP`, and the forfeit path through `GAME_OVER`) complete before the next event is looked at. Clients therefore never see a half-applied move.
 2. **Idempotent disconnects.** `CLIENT_DISCONNECTED` for a player who is no longer registered does nothing.
@@ -421,3 +421,4 @@ Race outcomes that follow from these rules:
 | Version | Date | Changes |
 |---|---|---|
 | 1.0 | 2026-10-04 | Initial FSM specification. The game engine diagram follows the course example (`INIT` → `WAITING_FOR_PLAYERS` → `GAME_START` → `PLAYER_TURN` ⇄ `EVALUATE_MOVE` → `GAME_OVER` → `CLEANUP`) with `CHECK_WIN_DRAW` added. Includes the T1–T21 transition table, the move evaluation diagram, connection termination handling (EOF rule, socket exceptions), the socket lifecycle diagram, and a tested reference session loop. |
+| 1.1 | 2026-10-18 | §6 now references the Sprint 2 concurrency model (`concurrency_design.md`). No state or transition changes. |

@@ -10,7 +10,7 @@
 | **Serialization** | JSON, UTF-8 |
 | **Framing** | Option A: newline-delimited JSON (`\n`, byte `0x0A`) |
 | **SOW reference** | §2 Application-Layer Messaging Protocol Blueprint (Sprint 1) |
-| **Companion documents** | [`fsm_specification.md`](fsm_specification.md) (server state machine) · [`ai_prompts.md`](ai_prompts.md) (AI prompting & constraint strategy) |
+| **Companion documents** | [`fsm_specification.md`](fsm_specification.md) (server state machine) · [`ai_prompts.md`](ai_prompts.md) (AI prompting & constraint strategy) · [`concurrency_design.md`](concurrency_design.md) (server concurrency, Sprint 2) |
 
 ---
 
